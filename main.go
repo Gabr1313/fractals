@@ -4,7 +4,6 @@ import (
 	"github.com/hajimehoshi/ebiten/v2"
 	"log"
 	"math"
-	"runtime"
 	"sync"
 	"time"
 	// "math/cmplx"
@@ -13,16 +12,16 @@ import (
 const (
 	SCREEN_WIDTH        = 1080
 	SCREEN_HEIGHT       = 1080
-	SQRT_DOTS_PER_PIXEL = 2
+	SQRT_DOTS_PER_PIXEL = 1
 	MAX_STEP            = 128
 	CENTRE              = complex(-.5, 0)
 	STARTING_POINT      = complex(0, 0)
 	ZOOM_X              = float64(3)
-	// should not be changed
-	WIDTH               = 1080 * SQRT_DOTS_PER_PIXEL
-	HEIGHT              = 1080 * SQRT_DOTS_PER_PIXEL
-	ZOOM_Y              = HEIGHT * ZOOM_X / WIDTH
-	RADIOUS             = float64(2)
+	// below value should not be changed
+	WIDTH   = 1080 * SQRT_DOTS_PER_PIXEL
+	HEIGHT  = 1080 * SQRT_DOTS_PER_PIXEL
+	ZOOM_Y  = HEIGHT * ZOOM_X / WIDTH
+	RADIOUS = float64(2)
 )
 
 func NewPalette() [][]byte {
@@ -92,108 +91,26 @@ func (g *Game) Calculate(palette *[][]byte) {
 	stepX := complex(ZOOM_X/(WIDTH-1), 0)
 	stepY := complex(0, -ZOOM_Y/(HEIGHT-1))
 
-	// DEFAULT
-	/* for i := 0; i < SCREEN_HEIGHT*4; i += 4 {
-		c := columnStart
-		for j := 0; j < SCREEN_WIDTH*4; j += 4 {
-			steps := DivSteps(c)
-			g.buf[i*SCREEN_WIDTH+j] = (*palette)[0][steps]
-			g.buf[i*SCREEN_WIDTH+j+1] = (*palette)[1][steps]
-			g.buf[i*SCREEN_WIDTH+j+2] = (*palette)[2][steps]
-			g.buf[i*SCREEN_WIDTH+j+3] = (*palette)[3][steps]
-			c += stepX
-		}
-		columnStart += stepY
-	}  */
-
-	// BAD
-	/* jobs := make(chan IdxPoint, SCREEN_HEIGHT*SCREEN_WIDTH)
 	var wg sync.WaitGroup
-	wg.Add(SCREEN_HEIGHT * SCREEN_WIDTH)
-	for i := 0; i < runtime.NumCPU(); i++ {
-		go func() {
-			for job := range jobs {
-				steps := DivSteps(job.c)
-				g.buf[job.idx] = (*palette)[0][steps]
-				g.buf[job.idx+1] = (*palette)[1][steps]
-				g.buf[job.idx+2] = (*palette)[2][steps]
-				g.buf[job.idx+3] = (*palette)[3][steps]
-				wg.Done()
-			}
-		}()
-	}
-	for i := 0; i < SCREEN_HEIGHT*4; i += 4 {
+	wg.Add(HEIGHT)
+	for i := 0; i < WIDTH*HEIGHT*4; i += 4 * WIDTH {
 		c := columnStart
-		for j := 0; j < SCREEN_WIDTH*4; j += 4 {
-			jobs <- IdxPoint{i*SCREEN_WIDTH + j, c}
-			c += stepX
-		}
-		columnStart += stepY
-	}
-	close(jobs)  */
-
-	// BETTER
-	/* var wg sync.WaitGroup
-	wg.Add(runtime.NumCPU())
-	iJump := SCREEN_HEIGHT * 4 / runtime.NumCPU()
-	for i := 0; i < SCREEN_HEIGHT*4; i += iJump {
-		i := i
-		columnStart := columnStart + stepY*complex(float64(i/4), 0)
+		j := i
 		go func() {
-			defer wg.Done()
-			// time1 := time.Duration(0)
-			// time2 := time.Duration(0)
-			stop:= min(i+iJump, SCREEN_HEIGHT*4)
-			for ; i < stop; i += 4 {
-				c := columnStart
-				for j := 0; j < SCREEN_WIDTH*4; j += 4 {
-					// tt := time.Now()
-					steps := DivSteps(c)
-					// time1 += time.Now().Sub(tt)
-					// tt = time.Now()
-					g.buf[i*SCREEN_WIDTH+j] = (*palette)[0][steps]
-					g.buf[i*SCREEN_WIDTH+j+1] = (*palette)[1][steps]
-					g.buf[i*SCREEN_WIDTH+j+2] = (*palette)[2][steps]
-					g.buf[i*SCREEN_WIDTH+j+3] = (*palette)[3][steps]
-					// time2 += time.Now().Sub(tt)
-					c += stepX
-				}
-				columnStart += stepY
-			}
-			// log.Printf("Time 1: %v | Time 2: %v", time1, time2)
-		}()
-	}
-	wg.Wait()   */
-
-	// BEST
-	jobs := make(chan IdxPoint, HEIGHT)
-	var wg sync.WaitGroup
-	wg.Add(runtime.NumCPU())
-	for i := 0; i < runtime.NumCPU(); i++ {
-		go func() {
-			for job := range jobs {
-				idx := job.idx
-				c := job.c
-				for j := 0; j < WIDTH*4; j += 4 {
-					steps := DivSteps(c)
-					g.buf[idx] = (*palette)[0][steps]
-					g.buf[idx+1] = (*palette)[1][steps]
-					g.buf[idx+2] = (*palette)[2][steps]
-					g.buf[idx+3] = (*palette)[3][steps]
-					idx += 4
-					c += stepX
-				}
+			stop := j + WIDTH*4
+			for ; j < stop; j += 4 {
+				steps := DivSteps(c)
+				g.buf[j] = (*palette)[0][steps]
+				g.buf[j+1] = (*palette)[1][steps]
+				g.buf[j+2] = (*palette)[2][steps]
+				g.buf[j+3] = (*palette)[3][steps]
+				c += stepX
 			}
 			wg.Done()
 		}()
-	}
-	for i := 0; i < WIDTH*HEIGHT*4; i += 4 * WIDTH {
-		c := columnStart
-		jobs <- IdxPoint{i, c}
 		columnStart += stepY
 	}
-	close(jobs)
-	wg.Wait()
+	wg.Wait() 
 
 	g.image.WritePixels(g.buf)
 }
