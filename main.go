@@ -3,17 +3,17 @@ package main
 import (
 	"github.com/hajimehoshi/ebiten/v2"
 	"log"
-	"math"
+	"runtime"
 	"sync"
 	"time"
-	// "math/cmplx"
 )
 
 const (
 	SCREEN_WIDTH        = 1080
 	SCREEN_HEIGHT       = 1080
 	SQRT_DOTS_PER_PIXEL = 2
-	MAX_STEP            = 1024
+	MAX_STEP            = 128
+	STEP_PER_FRAME      = 32
 	STARTING_POINT      = complex(0, 0)
 	CENTRE              = complex(-.75, 0)
 	ZOOM_X              = float64(2.5e-0)
@@ -21,142 +21,146 @@ const (
 	// ZOOM_X              = float64(2.5e-13) // max zoom
 
 	// below value should not be changed
-	WIDTH     = 1080 * SQRT_DOTS_PER_PIXEL
-	HEIGHT    = 1080 * SQRT_DOTS_PER_PIXEL
-	ZOOM_Y    = HEIGHT * ZOOM_X / WIDTH
-	THRESHOLD = float64(2)
+	GAME_WIDTH  = 1080 * SQRT_DOTS_PER_PIXEL
+	GAME_HEIGHT = 1080 * SQRT_DOTS_PER_PIXEL
+	ZOOM_Y      = GAME_HEIGHT * ZOOM_X / GAME_WIDTH
+	THRESHOLD   = float64(2)
 )
 
 // Wikipedia palette
 var pre_palette [64]byte = [64]byte{
-	9, 1, 47, 255,
-	4, 4, 73, 255,
-	0, 7, 100, 255,
-	12, 44, 138, 255,
-	24, 82, 177, 255,
-	57, 125, 209, 255,
-	134, 181, 229, 255,
-	211, 236, 248, 255,
-	241, 233, 191, 255,
-	248, 201, 95, 255,
-	255, 170, 0, 255,
-	204, 128, 0, 255,
-	153, 87, 0, 255,
-	106, 52, 3, 255,
-	66, 30, 15, 255,
-	25, 7, 26, 255,
+	9, 1, 47, 0xff,
+	4, 4, 73, 0xff,
+	0, 7, 100, 0xff,
+	12, 44, 138, 0xff,
+	24, 82, 177, 0xff,
+	57, 125, 209, 0xff,
+	134, 181, 229, 0xff,
+	211, 236, 248, 0xff,
+	241, 233, 191, 0xff,
+	248, 201, 95, 0xff,
+	255, 170, 0, 0xff,
+	204, 128, 0, 0xff,
+	153, 87, 0, 0xff,
+	106, 52, 3, 0xff,
+	66, 30, 15, 0xff,
+	25, 7, 26, 0xff,
 }
 
+// TODO: maybe it could be better to use the % operator
 func NewPalette() [][]byte {
 	palette := make([][]byte, 4)
 	for i := 0; i < 4; i++ {
-		palette[i] = make([]byte, MAX_STEP+1)
+		palette[i] = make([]byte, MAX_STEP)
 	}
-	for i := 0; i <= MAX_STEP; i++ {
-		palette[0][i] = pre_palette[(i*4)%64]
-		palette[1][i] = pre_palette[(i*4+1)%64]
-		palette[2][i] = pre_palette[(i*4+2)%64]
-		palette[3][i] = pre_palette[(i*4+3)%64]
-	}
-	palette[0][MAX_STEP] = 0
-	palette[1][MAX_STEP] = 0
-	palette[2][MAX_STEP] = 0
-	palette[3][MAX_STEP] = 0
-	return palette
-}
-
-func OldPalette() [][]byte {
-	palette := make([][]byte, 4)
-	for i := 0; i < 4; i++ {
-		palette[i] = make([]byte, MAX_STEP+1)
-	}
-	maxColor := float64(0xff)
-	for i := 0; i <= MAX_STEP; i++ {
-		palette[0][i] = byte(math.Sqrt(float64(i)/float64(MAX_STEP)) * maxColor)
-		palette[1][i] = byte(math.Sqrt(float64(i)/float64(MAX_STEP)) * maxColor)
-		palette[2][i] = byte(math.Sqrt(float64(i)/float64(MAX_STEP)) * maxColor)
-		palette[3][i] = 0xff
+	for i := 0; i < MAX_STEP; i++ {
+		palette[0][i] = pre_palette[(i*4)%len(pre_palette)]
+		palette[1][i] = pre_palette[(i*4+1)%len(pre_palette)]
+		palette[2][i] = pre_palette[(i*4+2)%len(pre_palette)]
+		palette[3][i] = pre_palette[(i*4+3)%len(pre_palette)]
 	}
 	return palette
 }
 
-func DivSteps(c complex128) int {
-	z := STARTING_POINT
-	i := 0
-	for ; i < MAX_STEP; i++ {
-		// MANDELBROT SET
+// returns the int -1 if the point is still in the set
+func DivSteps(c, z complex128, maxStep int) (complex128, int) {
+	for i := 0; i < maxStep; i++ {
 		z = z*z + c
 		if real(z)*real(z)+imag(z)*imag(z) > THRESHOLD*THRESHOLD {
-			break
+			return z, i
 		}
-
-		// JULIA SET: problem with RADIOUS (how to know when a point diverges?)
-		// c = c*c + z
-		// if real(c)*real(c)+imag(c)*imag(c) > RADIUS*RADIUS {
-		// 	break
-		// }
 	}
-	return i
+	return z, -1
 }
 
 type Game struct {
-	buf   []byte
-	image *ebiten.Image
-}
-
-type IdxStep struct {
-	idx, step int
-}
-
-type IdxPoint struct {
-	idx int
-	c   complex128
+	stepDone int
+	points   []complex128
+	finished []bool
+	buf      []byte
+	palette  [][]byte
+	image    *ebiten.Image
 }
 
 func NewGame() *Game {
 	palette := NewPalette()
 	g := &Game{
-		buf:   make([]byte, WIDTH*HEIGHT*4),
-		image: ebiten.NewImage(WIDTH, HEIGHT),
+		stepDone: 0,
+		points:   make([]complex128, GAME_WIDTH*GAME_HEIGHT),
+		finished: make([]bool, GAME_WIDTH*GAME_HEIGHT),
+		buf:      make([]byte, GAME_WIDTH*GAME_HEIGHT*4),
+		image:    ebiten.NewImage(GAME_WIDTH, GAME_HEIGHT),
+		palette:  palette,
 	}
-	start := time.Now()
-	g.Calculate(&palette)
-	end := time.Now()
-	log.Printf("Calculation took %dms-> %.2f FPS",
-		(end.Sub(start)).Milliseconds(), 1/(end.Sub(start)).Seconds())
+	g.ResetGame()
 	return g
 }
 
-func (g *Game) Calculate(palette *[][]byte) {
-	columnStart := CENTRE + complex(-ZOOM_X/2, ZOOM_Y/2)
-	stepX := complex(ZOOM_X/(WIDTH-1), 0)
-	stepY := complex(0, -ZOOM_Y/(HEIGHT-1))
+func (g *Game) ResetGame() {
+	g.stepDone = 0
+	for i := 0; i < GAME_WIDTH*GAME_HEIGHT; i++ {
+		g.points[i] = STARTING_POINT
+		g.finished[i] = false
+		g.buf[i*4] = (g.palette)[0][0]
+		g.buf[i*4+1] = (g.palette)[1][0]
+		g.buf[i*4+2] = (g.palette)[2][0]
+		g.buf[i*4+3] = (g.palette)[3][0]
+	}
+}
 
+func (g *Game) Calculate(palette *[][]byte, stepsTodo int) {
+	column := CENTRE + complex(-ZOOM_X/2, ZOOM_Y/2)
+	stepX := complex(ZOOM_X/(GAME_WIDTH-1), 0)
+	stepY := complex(0, -ZOOM_Y/(GAME_HEIGHT-1))
+
+	ncpus := runtime.NumCPU()
 	var wg sync.WaitGroup
-	wg.Add(HEIGHT)
-	for i := 0; i < WIDTH*HEIGHT*4; i += 4 * WIDTH {
-		c := columnStart
-		j := i
+	wg.Add(ncpus)
+	di := GAME_WIDTH * ncpus
+	stepYInner := complex(float64(ncpus), 0) * stepY
+	for cpu := 0; cpu < ncpus; cpu, column = cpu+1, column+stepY {
+		cpu := cpu
+		c0 := column
 		go func() {
-			stop := j + WIDTH*4
-			for ; j < stop; j += 4 {
-				steps := DivSteps(c)
-				g.buf[j] = (*palette)[0][steps]
-				g.buf[j+1] = (*palette)[1][steps]
-				g.buf[j+2] = (*palette)[2][steps]
-				g.buf[j+3] = (*palette)[3][steps]
-				c += stepX
+			defer wg.Done()
+			for i := cpu * GAME_WIDTH; i < GAME_WIDTH*GAME_HEIGHT; i, c0 = i+di, c0+stepYInner {
+				c := c0
+				stop := i + GAME_WIDTH
+				for j := i; j < stop; j, c = j+1, c+stepX {
+					// TODO: try to use channels, so I don't waste time with this if statement
+					// Are those real performance improvements?
+					if g.finished[j] {
+						continue
+					}
+					z, deltaStep := DivSteps(c, g.points[j], stepsTodo)
+					g.points[j] = z
+					if deltaStep == -1 {
+						continue
+					}
+					g.finished[j] = true
+					steps := g.stepDone + deltaStep
+					g.buf[j*4] = (*palette)[0][steps]
+					g.buf[j*4+1] = (*palette)[1][steps]
+					g.buf[j*4+2] = (*palette)[2][steps]
+					g.buf[j*4+3] = (*palette)[3][steps]
+				}
 			}
-			wg.Done()
 		}()
-		columnStart += stepY
 	}
 	wg.Wait()
+	g.stepDone += stepsTodo
 
 	g.image.WritePixels(g.buf)
 }
 
 func (g *Game) Update() error {
+	if g.stepDone < MAX_STEP {
+		start := time.Now()
+		g.Calculate(&g.palette, min(STEP_PER_FRAME, MAX_STEP-g.stepDone))
+		end := time.Now()
+		log.Printf("Calculation took %dms (%.2f FPS?)",
+			(end.Sub(start)).Milliseconds(), 1/(end.Sub(start)).Seconds())
+	}
 	return nil
 }
 
@@ -165,7 +169,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 }
 
 func (g *Game) Layout(outsideWidth, outsideHeight int) (screenWidth, screenHeight int) {
-	return WIDTH, HEIGHT
+	return GAME_WIDTH, GAME_HEIGHT
 }
 
 func main() {
