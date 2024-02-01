@@ -5,40 +5,33 @@ import (
 	"runtime"
 	"sync"
 	// "time"
-
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 )
 
-// TODO: WHAT TO DO WITH THE LOW ZOOM PROBLEM?
-// try to use channels, with random points
-
 // TODO: MOUSE GESTURE
+// TODO: LOAD FORM THE MIDDLE OF THE SCREEN, NOT FROM THE TOP
 
 const (
-	SCREEN_WIDTH        = 1080
-	SCREEN_HEIGHT       = 1080
+	SCREEN_WIDTH        = 720
+	SCREEN_HEIGHT       = 720
 	SQRT_DOTS_PER_PIXEL = 2
 	STARTING_POINT      = complex(0, 0)
 
 	// CENTRE_0       = complex(-.75, 0)
-	// TODO: increase max step a loooooot but using channels, so the cpu does
-	// not explode
-	MAX_STEP       = 1024
-	STEP_PER_FRAME = 8
-	ZOOM           = 2.5e-0
-	ZOOM_DELTA     = .9
+	DELTA_STEP     = 1024
+	MAX_STEP       = DELTA_STEP * 8
+	INITIAL_ZOOM   = 2.5e-0
+	ZOOM_DELTA     = .96
+	MOVEMENT_SPEED = 0.01
 
 	// max zoom
-	CENTRE_0 = complex(-.749000099001, 0.101000001)
-	// MAX_STEP       = 1024
-	// STEP_PER_FRAME = 1024
+	INITIAL_CENTER = complex(-.749000099001, 0.101000001)
 	// ZOOM           = 2.5e-13
-	// ZOOM_DELTA     = .9
 
 	// below value should not be changed
-	GAME_WIDTH     = 1080 * SQRT_DOTS_PER_PIXEL
-	GAME_HEIGHT    = 1080 * SQRT_DOTS_PER_PIXEL
+	GAME_WIDTH     = SCREEN_WIDTH * SQRT_DOTS_PER_PIXEL
+	GAME_HEIGHT    = SCREEN_HEIGHT * SQRT_DOTS_PER_PIXEL
 	THRESHOLD      = float64(2)
 	ZOOM_DELTA_REV = 1 / ZOOM_DELTA
 )
@@ -63,25 +56,16 @@ var (
 		66, 30, 15, 0xff,
 		25, 7, 26, 0xff,
 	}
-
-	// TODO: this should go in the game struct
-	CENTRE   = CENTRE_0
-	ZOOM_X   = ZOOM
-	ZOOM_Y   = GAME_HEIGHT * ZOOM_X / GAME_WIDTH
-	MOVEMENT = ZOOM_X * 0.01
 )
 
-// TODO: maybe it could be better to use the % operator
 func NewPalette() [][]byte {
-	palette := make([][]byte, 4)
-	for i := 0; i < 4; i++ {
-		palette[i] = make([]byte, MAX_STEP)
-	}
-	for i := 0; i < MAX_STEP; i++ {
-		palette[0][i] = pre_palette[(i*4)%len(pre_palette)]
-		palette[1][i] = pre_palette[(i*4+1)%len(pre_palette)]
-		palette[2][i] = pre_palette[(i*4+2)%len(pre_palette)]
-		palette[3][i] = pre_palette[(i*4+3)%len(pre_palette)]
+	palette := make([][]byte, len(pre_palette)/4)
+	for i := 0; i < len(pre_palette)/4; i++ {
+		palette[i] = make([]byte, 4)
+		palette[i][0] = pre_palette[i*4]
+		palette[i][1] = pre_palette[i*4+1]
+		palette[i][2] = pre_palette[i*4+2]
+		palette[i][3] = pre_palette[i*4+3]
 	}
 	return palette
 }
@@ -97,97 +81,148 @@ func DivSteps(c, z complex128, maxStep int) (complex128, int) {
 	return z, -1
 }
 
+type pointStatus struct {
+	z, c  complex128
+	steps int
+}
+
 type Game struct {
-	stepDone int
-	points   []complex128
-	finished []bool
-	buf      []byte
-	palette  [][]byte
-	image    *ebiten.Image
-	keys     []ebiten.Key
+	points     []pointStatus
+	buf        []byte
+	palette    [][]byte
+	nThreads   int
+	chIdx      chan int
+	chCanReset chan bool
+	chStop     chan bool
+	image      *ebiten.Image
+	wg         sync.WaitGroup
+	keys       []ebiten.Key
+	centre     complex128
+	zoomX      float64
+	zoomY      float64
+	movement   float64
 }
 
 func NewGame() *Game {
-	palette := NewPalette()
-	g := &Game{
-		stepDone: 0,
-		points:   make([]complex128, GAME_WIDTH*GAME_HEIGHT),
-		finished: make([]bool, GAME_WIDTH*GAME_HEIGHT),
-		buf:      make([]byte, GAME_WIDTH*GAME_HEIGHT*4),
-		image:    ebiten.NewImage(GAME_WIDTH, GAME_HEIGHT),
-		palette:  palette,
+	nThreads := runtime.NumCPU()
+	g := Game{
+		points:     make([]pointStatus, GAME_WIDTH*GAME_HEIGHT),
+		buf:        make([]byte, GAME_WIDTH*GAME_HEIGHT*4),
+		palette:    NewPalette(),
+		nThreads:   nThreads,
+		chIdx:      make(chan int, nThreads),
+		chCanReset: make(chan bool, 1),
+		chStop:     make(chan bool, nThreads),
+		image:      ebiten.NewImage(GAME_WIDTH, GAME_HEIGHT),
+		centre:     INITIAL_CENTER,
+		zoomX:      INITIAL_ZOOM,
+		zoomY:      INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
+		movement:   INITIAL_ZOOM * MOVEMENT_SPEED,
+		// wg:     default
+		// keys:     default
 	}
-	g.ResetGame()
-	return g
+	go func() {
+		for i := 0; i < g.nThreads; i++ {
+			<-g.chStop
+		}
+	}()
+	g.chCanReset <- true
+	go g.ResetGame()
+	return &g
+}
+
+func worker(g *Game) {
+	defer g.wg.Done()
+	for {
+		select {
+		case <-g.chStop:
+			return
+		case idx := <-g.chIdx:
+			select {
+			case <-g.chStop:
+				return
+			default:
+			}
+			point := &g.points[idx]
+			z, stepDone := DivSteps(point.c, point.z, DELTA_STEP)
+			point.z = z
+			if stepDone == -1 {
+				point.steps += DELTA_STEP
+				if point.steps < MAX_STEP {
+					g.chIdx <- idx
+				}
+				continue
+			}
+			point.steps += stepDone
+			s := point.steps % len(g.palette)
+			g.buf[idx*4] = g.palette[s][0]
+			g.buf[idx*4+1] = g.palette[s][1]
+			g.buf[idx*4+2] = g.palette[s][2]
+			g.buf[idx*4+3] = g.palette[s][3]
+		}
+	}
 }
 
 func (g *Game) ResetGame() {
-	g.stepDone = 0
-	for i := 0; i < GAME_WIDTH*GAME_HEIGHT; i++ {
-		g.points[i] = STARTING_POINT
-		g.finished[i] = false
-		g.buf[i*4] = (g.palette)[0][0]
-		g.buf[i*4+1] = (g.palette)[1][0]
-		g.buf[i*4+2] = (g.palette)[2][0]
-		g.buf[i*4+3] = (g.palette)[3][0]
+	select {
+	case <-g.chCanReset:
+	default:
+		return
 	}
-}
+	for cpu := 0; cpu < g.nThreads; cpu++ {
+		g.chStop <- true
+	}
+	g.wg.Wait()
+	close(g.chIdx)
+	g.chIdx = make(chan int, GAME_WIDTH*GAME_HEIGHT+g.nThreads)
+	column := g.centre + complex(-g.zoomX/2, g.zoomY/2)
+	deltaX := complex(g.zoomX/(GAME_WIDTH-1), 0)
+	deltaY := complex(0, -g.zoomY/(GAME_HEIGHT-1))
+	deltaCpuY := complex(float64(g.nThreads), 0) * deltaY
+	deltaI := g.nThreads * GAME_WIDTH
 
-func (g *Game) Move(direction complex128) {
-	CENTRE += direction
-	g.ResetGame()
-}
-
-func (g *Game) Zoom(zoom float64) {
-	ZOOM_X *= zoom
-	ZOOM_Y = GAME_HEIGHT * ZOOM_X / GAME_WIDTH
-	MOVEMENT = ZOOM_X * 0.01
-	g.ResetGame()
-}
-
-func (g *Game) Calculate(palette *[][]byte, stepsTodo int) {
-	column := CENTRE + complex(-ZOOM_X/2, ZOOM_Y/2)
-	stepX := complex(ZOOM_X/(GAME_WIDTH-1), 0)
-	stepY := complex(0, -ZOOM_Y/(GAME_HEIGHT-1))
-
-	ncpus := runtime.NumCPU()
-	var wg sync.WaitGroup
-	wg.Add(ncpus)
-	di := GAME_WIDTH * ncpus
-	stepYInner := complex(float64(ncpus), 0) * stepY
-	for cpu := 0; cpu < ncpus; cpu, column = cpu+1, column+stepY {
+	var localWg sync.WaitGroup
+	localWg.Add(g.nThreads)
+	for cpu := 0; cpu < g.nThreads; cpu, column = cpu+1, column+deltaY {
+		column := column
 		cpu := cpu
-		c0 := column
 		go func() {
-			defer wg.Done()
-			for i := cpu * GAME_WIDTH; i < GAME_WIDTH*GAME_HEIGHT; i, c0 = i+di, c0+stepYInner {
-				c := c0
-				stop := i + GAME_WIDTH
-				for j := i; j < stop; j, c = j+1, c+stepX {
-					// TODO: try to use channels, so I don't waste time with this if statement
-					// Are those real performance improvements?
-					if g.finished[j] {
-						continue
-					}
-					z, deltaStep := DivSteps(c, g.points[j], stepsTodo)
-					g.points[j] = z
-					if deltaStep == -1 {
-						continue
-					}
-					g.finished[j] = true
-					steps := g.stepDone + deltaStep
-					g.buf[j*4] = (*palette)[0][steps]
-					g.buf[j*4+1] = (*palette)[1][steps]
-					g.buf[j*4+2] = (*palette)[2][steps]
-					g.buf[j*4+3] = (*palette)[3][steps]
+			defer localWg.Done()
+			for i := cpu * GAME_WIDTH; i < GAME_WIDTH*GAME_HEIGHT; i, column = i+deltaI, column+deltaCpuY {
+				c := column
+				for j := i; j < i+GAME_WIDTH; j, c = j+1, c+deltaX {
+					point := &g.points[j]
+					point.c = c
+					point.z = STARTING_POINT
+					point.steps = 0
+					g.buf[j*4] = g.palette[0][0]
+					g.buf[j*4+1] = g.palette[0][1]
+					g.buf[j*4+2] = g.palette[0][2]
+					g.buf[j*4+3] = g.palette[0][3]
+					g.chIdx <- j
 				}
 			}
 		}()
 	}
-	wg.Wait()
-	g.stepDone += stepsTodo
+	localWg.Wait()
+	g.chCanReset <- true
 
-	g.image.WritePixels(g.buf)
+	g.wg.Add(g.nThreads)
+	for cpu := 0; cpu < g.nThreads; cpu++ {
+		go worker(g)
+	}
+}
+
+func (g *Game) Move(direction complex128) {
+	g.centre += direction
+	go g.ResetGame()
+}
+
+func (g *Game) Zoom(zoom float64) {
+	g.zoomX *= zoom
+	g.zoomY = GAME_HEIGHT * g.zoomX / GAME_WIDTH
+	g.movement = g.zoomX * 0.01
+	go g.ResetGame()
 }
 
 func (g *Game) Update() error {
@@ -198,34 +233,29 @@ func (g *Game) Update() error {
 	for _, k := range g.keys {
 		switch k {
 		case ebiten.KeyR:
-			ZOOM_X = ZOOM
-			ZOOM_Y = GAME_HEIGHT * ZOOM_X / GAME_WIDTH
-			MOVEMENT = ZOOM_X * 0.01
-			g.ResetGame()
+			g.centre = INITIAL_CENTER
+			g.zoomX = INITIAL_ZOOM
+			g.zoomY = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
+			g.movement = INITIAL_ZOOM * 0.01
+			go g.ResetGame()
 		case ebiten.KeyQ:
 			return ebiten.Termination
 		case ebiten.KeyH, ebiten.KeyArrowLeft:
-			g.Move(complex(-MOVEMENT, 0))
+			g.Move(complex(-g.movement, 0))
 		case ebiten.KeyJ, ebiten.KeyArrowDown:
-			g.Move(complex(0, -MOVEMENT))
+			g.Move(complex(0, -g.movement))
 		case ebiten.KeyK, ebiten.KeyArrowUp:
-			g.Move(complex(0, MOVEMENT))
+			g.Move(complex(0, g.movement))
 		case ebiten.KeyL, ebiten.KeyArrowRight:
-			g.Move(complex(MOVEMENT, 0))
-		case ebiten.KeyF:
+			g.Move(complex(g.movement, 0))
+		case ebiten.KeyF, ebiten.KeySpace:
+			log.Print("zoom")
 			g.Zoom(ZOOM_DELTA)
-		case ebiten.KeyD:
+		case ebiten.KeyD, ebiten.KeyBackspace:
 			g.Zoom(ZOOM_DELTA_REV)
 		}
 	}
-
-	if g.stepDone < MAX_STEP {
-		// start := time.Now()
-		g.Calculate(&g.palette, min(STEP_PER_FRAME, MAX_STEP-g.stepDone))
-		// end := time.Now()
-		// log.Printf("Calculation took %dms (%.2f FPS?)",
-		// 	(end.Sub(start)).Milliseconds(), 1/(end.Sub(start)).Seconds())
-	}
+	g.image.WritePixels(g.buf)
 	return nil
 }
 
