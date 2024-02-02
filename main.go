@@ -9,8 +9,8 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 )
 
-// TODO: MOUSE GESTURE
-// TODO: LOAD FORM THE MIDDLE OF THE SCREEN, NOT FROM THE TOP
+// TODO: IF MOVEMENT IN ANY DIRECTION, DON'T RE-CALCULATE ALL THE PIXELS
+// TODO: LOAD FORM THE MIDDLE OF THE SCREEN, NOT FROM THE TOP (WHEN ZOOMING)
 
 const (
 	SCREEN_WIDTH        = 720
@@ -19,21 +19,21 @@ const (
 	STARTING_POINT      = complex(0, 0)
 
 	// CENTRE_0       = complex(-.75, 0)
-	DELTA_STEP     = 1024
-	MAX_STEP       = DELTA_STEP * 8
-	INITIAL_ZOOM   = 2.5e-0
-	ZOOM_DELTA     = .96
-	MOVEMENT_SPEED = 0.01
+	DELTA_STEP        = 1024
+	MAX_STEP          = DELTA_STEP * 8
+	INITIAL_ZOOM      = 2.5e-0
+	ZOOM_DELTA        = .96
+	MOUSE_WHEEL_SPEED = 2.0
+	MOVEMENT_SPEED    = 0.01
 
 	// max zoom
 	INITIAL_CENTER = complex(-.749000099001, 0.101000001)
 	// ZOOM           = 2.5e-13
 
 	// below value should not be changed
-	GAME_WIDTH     = SCREEN_WIDTH * SQRT_DOTS_PER_PIXEL
-	GAME_HEIGHT    = SCREEN_HEIGHT * SQRT_DOTS_PER_PIXEL
-	THRESHOLD      = float64(2)
-	ZOOM_DELTA_REV = 1 / ZOOM_DELTA
+	GAME_WIDTH  = SCREEN_WIDTH * SQRT_DOTS_PER_PIXEL
+	GAME_HEIGHT = SCREEN_HEIGHT * SQRT_DOTS_PER_PIXEL
+	THRESHOLD   = float64(2)
 )
 
 // Wikipedia palette
@@ -86,40 +86,49 @@ type pointStatus struct {
 	steps int
 }
 
+type mouse struct {
+	isPressed bool
+	x, y      int
+}
+
 type Game struct {
-	points     []pointStatus
-	buf        []byte
-	palette    [][]byte
-	nThreads   int
-	chIdx      chan int
-	chCanReset chan bool
-	chStop     chan bool
-	image      *ebiten.Image
-	wg         sync.WaitGroup
-	keys       []ebiten.Key
-	centre     complex128
-	zoomX      float64
-	zoomY      float64
-	movement   float64
+	points        []pointStatus
+	buf           []byte
+	palette       [][]byte
+	nThreads      int
+	chIdx         chan int
+	chCanReset    chan bool
+	chStop        chan bool
+	image         *ebiten.Image
+	centre        complex128
+	zoomX         float64
+	zoomY         float64
+	movementSpeed float64
+	wg            sync.WaitGroup
+	keys          []ebiten.Key
+	mouse         mouse
+	needUpdate    bool
 }
 
 func NewGame() *Game {
-	nThreads := runtime.NumCPU()
+	nThreads := max(1, runtime.NumCPU()-1)
 	g := Game{
-		points:     make([]pointStatus, GAME_WIDTH*GAME_HEIGHT),
-		buf:        make([]byte, GAME_WIDTH*GAME_HEIGHT*4),
-		palette:    NewPalette(),
-		nThreads:   nThreads,
-		chIdx:      make(chan int, nThreads),
-		chCanReset: make(chan bool, 1),
-		chStop:     make(chan bool, nThreads),
-		image:      ebiten.NewImage(GAME_WIDTH, GAME_HEIGHT),
-		centre:     INITIAL_CENTER,
-		zoomX:      INITIAL_ZOOM,
-		zoomY:      INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
-		movement:   INITIAL_ZOOM * MOVEMENT_SPEED,
-		// wg:     default
-		// keys:     default
+		points:        make([]pointStatus, GAME_WIDTH*GAME_HEIGHT),
+		buf:           make([]byte, GAME_WIDTH*GAME_HEIGHT*4),
+		palette:       NewPalette(),
+		nThreads:      nThreads,
+		chIdx:         make(chan int, nThreads),
+		chCanReset:    make(chan bool, 1),
+		chStop:        make(chan bool, nThreads),
+		image:         ebiten.NewImage(GAME_WIDTH, GAME_HEIGHT),
+		centre:        INITIAL_CENTER,
+		zoomX:         INITIAL_ZOOM,
+		zoomY:         INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
+		movementSpeed: INITIAL_ZOOM * MOVEMENT_SPEED,
+		// wg:         default
+		// keys:       default
+		// mouse:      default
+		// needUpdate: default
 	}
 	go func() {
 		for i := 0; i < g.nThreads; i++ {
@@ -127,7 +136,7 @@ func NewGame() *Game {
 		}
 	}()
 	g.chCanReset <- true
-	go g.ResetGame()
+	go g.doTheMath()
 	return &g
 }
 
@@ -163,10 +172,12 @@ func worker(g *Game) {
 	}
 }
 
-func (g *Game) ResetGame() {
+func (g *Game) doTheMath() {
 	select {
 	case <-g.chCanReset:
+		g.needUpdate = false
 	default:
+		g.needUpdate = true
 		return
 	}
 	for cpu := 0; cpu < g.nThreads; cpu++ {
@@ -213,19 +224,65 @@ func (g *Game) ResetGame() {
 	}
 }
 
-func (g *Game) Move(direction complex128) {
-	g.centre += direction
-	go g.ResetGame()
+func (g *Game) Move(delta complex128) {
+	g.centre += delta
+	go g.doTheMath()
 }
 
 func (g *Game) Zoom(zoom float64) {
 	g.zoomX *= zoom
 	g.zoomY = GAME_HEIGHT * g.zoomX / GAME_WIDTH
-	g.movement = g.zoomX * 0.01
-	go g.ResetGame()
+	g.movementSpeed = g.zoomX * 0.01
+	go g.doTheMath()
+}
+
+func (g *Game) ZoomFixedMouse(zoom float64, mouseX, mouseY int) {
+	fixedPoint := complex(float64(g.mouse.x-GAME_WIDTH/2)*g.zoomX/GAME_WIDTH,
+		float64(-g.mouse.y+GAME_HEIGHT/2)*g.zoomY/GAME_HEIGHT)
+
+	g.zoomX *= zoom
+	g.zoomY = g.zoomX * GAME_HEIGHT / GAME_WIDTH
+
+	substitutedPoint := complex(float64(g.mouse.x-GAME_WIDTH/2)*g.zoomX/GAME_WIDTH,
+		float64(-g.mouse.y+GAME_HEIGHT/2)*g.zoomY/GAME_HEIGHT)
+	delta := fixedPoint - substitutedPoint
+	g.centre += delta
+
+	g.movementSpeed = g.zoomX * 0.01
+	go g.doTheMath()
+}
+
+func (g *Game) UpdateMouse() {
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+		g.mouse.isPressed = true
+		x, y := ebiten.CursorPosition()
+		g.mouse.x, g.mouse.y = x, y
+	}
+	if inpututil.IsMouseButtonJustReleased(ebiten.MouseButtonLeft) {
+		g.mouse.isPressed = false
+	}
+	x, y := ebiten.CursorPosition()
+	if g.mouse.isPressed && (x != g.mouse.x || y != g.mouse.y) {
+		delta := complex(float64(g.mouse.x-x)*g.zoomX/GAME_WIDTH,
+			float64(y-g.mouse.y)*g.zoomY/GAME_HEIGHT)
+		g.Move(delta)
+	} else {
+		_, dy := ebiten.Wheel()
+		if dy != 0 {
+			var zoom float64
+			if dy > 0 {
+				zoom = ZOOM_DELTA / MOUSE_WHEEL_SPEED
+			} else {
+				zoom = MOUSE_WHEEL_SPEED / ZOOM_DELTA
+			}
+			g.ZoomFixedMouse(zoom, x, y)
+		}
+	}
+	g.mouse.x, g.mouse.y = x, y
 }
 
 func (g *Game) Update() error {
+	g.UpdateMouse()
 	g.keys = inpututil.AppendPressedKeys(g.keys[:0])
 	// if ebiten.IsKeyPressed(ebiten.KeyEscape) {
 	//return ebiten.Termination
@@ -236,26 +293,28 @@ func (g *Game) Update() error {
 			g.centre = INITIAL_CENTER
 			g.zoomX = INITIAL_ZOOM
 			g.zoomY = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
-			g.movement = INITIAL_ZOOM * 0.01
-			go g.ResetGame()
+			g.movementSpeed = INITIAL_ZOOM * 0.01
+			go g.doTheMath()
 		case ebiten.KeyQ:
 			return ebiten.Termination
 		case ebiten.KeyH, ebiten.KeyArrowLeft:
-			g.Move(complex(-g.movement, 0))
+			g.Move(complex(-g.movementSpeed, 0))
 		case ebiten.KeyJ, ebiten.KeyArrowDown:
-			g.Move(complex(0, -g.movement))
+			g.Move(complex(0, -g.movementSpeed))
 		case ebiten.KeyK, ebiten.KeyArrowUp:
-			g.Move(complex(0, g.movement))
+			g.Move(complex(0, g.movementSpeed))
 		case ebiten.KeyL, ebiten.KeyArrowRight:
-			g.Move(complex(g.movement, 0))
+			g.Move(complex(g.movementSpeed, 0))
 		case ebiten.KeyF, ebiten.KeySpace:
-			log.Print("zoom")
 			g.Zoom(ZOOM_DELTA)
 		case ebiten.KeyD, ebiten.KeyBackspace:
-			g.Zoom(ZOOM_DELTA_REV)
+			g.Zoom(1 / ZOOM_DELTA)
 		}
 	}
 	g.image.WritePixels(g.buf)
+	if g.needUpdate {
+		go g.doTheMath()
+	}
 	return nil
 }
 
