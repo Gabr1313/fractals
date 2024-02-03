@@ -17,7 +17,6 @@ import (
 //			already set pixel
 //			- to the same thing starting from the rightmost pixel
 //			- repeat
-// TODO: if movement in any direction, don't re-calculate all the pixels
 
 const (
 	SCREEN_WIDTH        = 720
@@ -31,7 +30,7 @@ const (
 	INITIAL_ZOOM      = 2.5e-0
 	ZOOM_DELTA        = .95
 	MOUSE_WHEEL_SPEED = 1
-	MOVEMENT_SPEED    = 0.01
+	MOVEMENT_SPEED    = SCREEN_WIDTH / 100
 
 	// below values should not be changed
 	GAME_WIDTH  = SCREEN_WIDTH * SQRT_DOTS_PER_PIXEL
@@ -86,8 +85,9 @@ func DivSteps(c, z complex128, maxStep int) (complex128, int) {
 }
 
 type PointStatus struct {
-	z, c  complex128
-	steps int
+	z, c     complex128
+	steps    int
+	finished bool
 }
 
 type Mouse struct {
@@ -96,7 +96,6 @@ type Mouse struct {
 }
 
 type ThreadStatus struct {
-	needUpdate     chan bool
 	nThreads       int
 	finishedThread sync.WaitGroup
 	idx            chan int
@@ -106,27 +105,38 @@ type ThreadStatus struct {
 }
 
 type PositionInfo struct {
-	centre        complex128
-	zoomX         float64
-	zoomY         float64
-	movementSpeed float64
+	centre complex128
+	zoomX  float64
+	zoomY  float64
+}
+
+type DoublePoints struct {
+	dbPoints [2][]PointStatus
+	curr     int
 }
 
 type Game struct {
-	points  []PointStatus
-	buf     []byte
-	palette [][]byte
-	image   *ebiten.Image
-	keys    []ebiten.Key
-	mouse   Mouse
-	th      ThreadStatus
-	pos     PositionInfo
+	palette       [][]byte
+	keys          []ebiten.Key
+	buf           []byte
+	pp            DoublePoints
+	mouse         Mouse
+	th            ThreadStatus
+	pos           PositionInfo
+	image         *ebiten.Image
+	movementSpeed int
 }
 
 func NewGame() *Game {
 	nThreads := runtime.NumCPU()
 	g := Game{
-		points:  make([]PointStatus, GAME_WIDTH*GAME_HEIGHT),
+		pp: DoublePoints{
+			dbPoints: [2][]PointStatus{
+				make([]PointStatus, GAME_WIDTH*GAME_HEIGHT),
+				make([]PointStatus, GAME_WIDTH*GAME_HEIGHT),
+			},
+			curr: 0,
+		},
 		buf:     make([]byte, GAME_WIDTH*GAME_HEIGHT*4),
 		palette: NewPalette(),
 		image:   ebiten.NewImage(GAME_WIDTH, GAME_HEIGHT),
@@ -138,15 +148,14 @@ func NewGame() *Game {
 			stop:       make(chan bool, nThreads),
 			canReset:   make(chan bool, 1),
 			bufChaged:  make(chan bool, 1),
-			needUpdate: make(chan bool, 1),
 			// wg         default
 		},
 		pos: PositionInfo{
-			centre:        INITIAL_CENTER,
-			zoomX:         INITIAL_ZOOM,
-			zoomY:         INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
-			movementSpeed: INITIAL_ZOOM * MOVEMENT_SPEED,
+			centre: INITIAL_CENTER,
+			zoomX:  INITIAL_ZOOM,
+			zoomY:  INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
 		},
+		movementSpeed: MOVEMENT_SPEED,
 	}
 	go func() {
 		for i := 0; i < g.th.nThreads; i++ {
@@ -164,7 +173,7 @@ func worker(g *Game) {
 		case <-g.th.stop:
 			return
 		case idx := <-g.th.idx:
-			point := &g.points[idx]
+			point := &g.pp.dbPoints[g.pp.curr][idx]
 			z, stepDone := DivSteps(point.c, point.z, DELTA_STEP)
 			point.z = z
 			if stepDone == -1 {
@@ -175,11 +184,8 @@ func worker(g *Game) {
 				continue
 			}
 			point.steps += stepDone
-			s := point.steps % len(g.palette)
-			g.buf[idx*4] = g.palette[s][0]
-			g.buf[idx*4+1] = g.palette[s][1]
-			g.buf[idx*4+2] = g.palette[s][2]
-			g.buf[idx*4+3] = g.palette[s][3]
+			point.finished = true
+			g.writeToBuffer(idx, point.steps)
 			select {
 			case g.th.bufChaged <- true:
 			default:
@@ -188,11 +194,20 @@ func worker(g *Game) {
 	}
 }
 
+func (g *Game) writeToBuffer(idx, s int) {
+	buf := &g.buf
+	pal := &g.palette[s%len(g.palette)]
+	idx *= 4
+	(*buf)[idx] = (*pal)[0]
+	(*buf)[idx+1] = (*pal)[1]
+	(*buf)[idx+2] = (*pal)[2]
+	(*buf)[idx+3] = (*pal)[3]
+}
+
 func (g *Game) doTheMath() {
 	select {
 	case <-g.th.canReset:
 	default:
-		g.th.needUpdate <- true
 		return
 	}
 	for cpu := 0; cpu < g.th.nThreads; cpu++ {
@@ -200,38 +215,36 @@ func (g *Game) doTheMath() {
 	}
 	g.th.finishedThread.Wait()
 	close(g.th.idx)
+	g.th.finishedThread.Add(g.th.nThreads)
+	g.th.canReset <- true
 
 	g.th.idx = make(chan int, GAME_WIDTH*GAME_HEIGHT+g.th.nThreads)
 	leftPoint := g.pos.centre + complex(-g.pos.zoomX/2, g.pos.zoomY/2)
 	deltaX := complex(g.pos.zoomX/(GAME_WIDTH-1), 0)
 	deltaY := complex(0, -g.pos.zoomY/(GAME_HEIGHT-1))
 	deltaCpuY := complex(float64(g.th.nThreads), 0) * deltaY
-	deltaI := g.th.nThreads * GAME_WIDTH
 
-	g.th.finishedThread.Add(g.th.nThreads)
-	g.th.canReset <- true
 	for cpu := 0; cpu < g.th.nThreads; cpu, leftPoint = cpu+1, leftPoint+deltaY {
 		leftPoint := leftPoint
 		cpu := cpu
 		go func() {
 			defer g.th.finishedThread.Done()
-			for i := cpu * GAME_WIDTH; i < GAME_WIDTH*GAME_HEIGHT; i, leftPoint = i+deltaI, leftPoint+deltaCpuY {
+			for i := cpu; i < GAME_HEIGHT; i, leftPoint = i+g.th.nThreads, leftPoint+deltaCpuY {
 				c := leftPoint
-				for j := i; j < i+GAME_WIDTH; j, c = j+1, c+deltaX {
+				for j := 0; j < GAME_WIDTH; j, c = j+1, c+deltaX {
 					select {
 					case <-g.th.stop:
 						return
 					default:
 					}
-					point := &g.points[j]
+					idx := i*GAME_WIDTH + j
+					point := &g.pp.dbPoints[g.pp.curr][idx]
 					point.c = c
 					point.z = STARTING_POINT
 					point.steps = 0
-					g.buf[j*4] = g.palette[0][0]
-					g.buf[j*4+1] = g.palette[0][1]
-					g.buf[j*4+2] = g.palette[0][2]
-					g.buf[j*4+3] = g.palette[0][3]
-					g.th.idx <- j
+					point.finished = false
+					g.writeToBuffer(idx, point.steps)
+					g.th.idx <- idx
 				}
 			}
 			worker(g)
@@ -239,9 +252,11 @@ func (g *Game) doTheMath() {
 	}
 }
 
-func (g *Game) Move(delta complex128) {
+func (g *Game) Move(dx, dy int) {
+	delta := complex(float64(-dx)*g.pos.zoomX/GAME_WIDTH,
+		float64(dy)*g.pos.zoomY/GAME_HEIGHT)
 	g.pos.centre += delta
-	g.doTheMath()
+	g.copyThenDoTheMath(dx, dy)
 }
 
 func (g *Game) Zoom(zoom float64) {
@@ -251,7 +266,6 @@ func (g *Game) Zoom(zoom float64) {
 	}
 	g.pos.zoomX = newZoom
 	g.pos.zoomY = newZoom * GAME_HEIGHT / GAME_WIDTH
-	g.pos.movementSpeed = g.pos.zoomX * MOVEMENT_SPEED
 	g.doTheMath()
 }
 
@@ -271,7 +285,6 @@ func (g *Game) ZoomFixedMouse(zoom float64, mouseX, mouseY int) {
 	delta := fixedPoint - substitutedPoint
 	g.pos.centre += delta
 
-	g.pos.movementSpeed = g.pos.zoomX * MOVEMENT_SPEED
 	g.doTheMath()
 }
 
@@ -286,9 +299,7 @@ func (g *Game) UpdateMouse() {
 	}
 	x, y := ebiten.CursorPosition()
 	if g.mouse.isPressed && (x != g.mouse.x || y != g.mouse.y) {
-		delta := complex(float64(g.mouse.x-x)*g.pos.zoomX/GAME_WIDTH,
-			float64(y-g.mouse.y)*g.pos.zoomY/GAME_HEIGHT)
-		g.Move(delta)
+		g.Move(x-g.mouse.x, y-g.mouse.y)
 	} else {
 		_, dy := ebiten.Wheel()
 		if dy != 0 {
@@ -312,18 +323,17 @@ func (g *Game) UpdateKeyboard() error {
 			g.pos.centre = INITIAL_CENTER
 			g.pos.zoomX = INITIAL_ZOOM
 			g.pos.zoomY = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
-			g.pos.movementSpeed = INITIAL_ZOOM * MOVEMENT_SPEED
 			g.doTheMath()
 		case ebiten.KeyQ:
 			return ebiten.Termination
 		case ebiten.KeyH, ebiten.KeyArrowLeft:
-			g.Move(complex(-g.pos.movementSpeed, 0))
+			g.Move(-g.movementSpeed, 0)
 		case ebiten.KeyJ, ebiten.KeyArrowDown:
-			g.Move(complex(0, -g.pos.movementSpeed))
+			g.Move(0, -g.movementSpeed)
 		case ebiten.KeyK, ebiten.KeyArrowUp:
-			g.Move(complex(0, g.pos.movementSpeed))
+			g.Move(0, g.movementSpeed)
 		case ebiten.KeyL, ebiten.KeyArrowRight:
-			g.Move(complex(g.pos.movementSpeed, 0))
+			g.Move(g.movementSpeed, 0)
 		case ebiten.KeyF, ebiten.KeySpace:
 			g.Zoom(ZOOM_DELTA)
 		case ebiten.KeyD, ebiten.KeyBackspace:
@@ -338,11 +348,6 @@ func (g *Game) Update() error {
 	err := g.UpdateKeyboard()
 	if err != nil {
 		return err
-	}
-	select {
-	case <-g.th.needUpdate:
-		g.doTheMath()
-	default:
 	}
 	select {
 	case <-g.th.bufChaged:
@@ -365,5 +370,73 @@ func main() {
 	ebiten.SetWindowTitle("Mandelbrot set")
 	if err := ebiten.RunGame(NewGame()); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func (g *Game) copyThenDoTheMath(dx, dy int) {
+	select {
+	case <-g.th.canReset:
+	default:
+		return
+	}
+	for cpu := 0; cpu < g.th.nThreads; cpu++ {
+		g.th.stop <- true
+	}
+	g.th.finishedThread.Wait()
+	close(g.th.idx)
+	g.th.finishedThread.Add(g.th.nThreads)
+	g.th.canReset <- true
+
+	g.th.idx = make(chan int, GAME_WIDTH*GAME_HEIGHT+g.th.nThreads)
+	leftPoint := g.pos.centre + complex(-g.pos.zoomX/2, g.pos.zoomY/2)
+	deltaX := complex(g.pos.zoomX/(GAME_WIDTH-1), 0)
+	deltaY := complex(0, -g.pos.zoomY/(GAME_HEIGHT-1))
+	deltaCpuY := complex(float64(g.th.nThreads), 0) * deltaY
+
+	var xStart, yStart, xEnd, yEnd int
+	if dx > 0 {
+		xStart = dx
+		xEnd = GAME_WIDTH
+	} else {
+		xStart = 0
+		xEnd = GAME_WIDTH + dx
+	}
+	if dy > 0 {
+		yStart = dy
+		yEnd = GAME_HEIGHT
+	} else {
+		yStart = 0
+		yEnd = GAME_HEIGHT + dy
+	}
+
+	g.pp.curr = 1 - g.pp.curr
+	for cpu := 0; cpu < g.th.nThreads; cpu, leftPoint = cpu+1, leftPoint+deltaY {
+		leftPoint := leftPoint
+		cpu := cpu
+		go func() {
+			defer g.th.finishedThread.Done()
+			for i := cpu; i < GAME_HEIGHT; i, leftPoint = i+g.th.nThreads, leftPoint+deltaCpuY {
+				c := leftPoint
+				for j := 0; j < GAME_WIDTH; j, c = j+1, c+deltaX {
+					idx := i*GAME_WIDTH + j
+					point := &g.pp.dbPoints[g.pp.curr][idx]
+					if (yStart <= i && i < yEnd) && (xStart <= j && j < xEnd) {
+						prevIdx := (i-dy)*GAME_WIDTH + (j - dx)
+						prevPoint := &g.pp.dbPoints[1-g.pp.curr][prevIdx]
+						*point = *prevPoint
+					} else {
+						point.c = c
+						point.z = STARTING_POINT
+						point.steps = 0
+						point.finished = false
+					}
+					g.writeToBuffer(idx, point.steps)
+					if !point.finished {
+						g.th.idx <- idx
+					}
+				}
+			}
+			worker(g)
+		}()
 	}
 }
