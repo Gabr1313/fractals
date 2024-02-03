@@ -17,10 +17,12 @@ const (
 	SQRT_DOTS_PER_PIXEL = 2
 	STARTING_POINT      = complex(0, 0)
 
+	// INITIAL_CENTER = complex(0, 1)
+	// INITIAL_ZOOM   = 2.5e-13
 	INITIAL_CENTER    = complex(-.75, 0)
+	INITIAL_ZOOM      = 2.5e-0
 	DELTA_STEP        = 1024
 	MAX_STEP          = DELTA_STEP * 8
-	INITIAL_ZOOM      = 2.5e-0
 	ZOOM_DELTA        = .94
 	MOUSE_WHEEL_SPEED = 1
 	MOVEMENT_SPEED    = SCREEN_WIDTH / 50
@@ -212,13 +214,13 @@ func (g *Game) ReadKeyboard() error {
 		case ebiten.KeyQ:
 			return ebiten.Termination
 		case ebiten.KeyH, ebiten.KeyArrowLeft:
-			g.CpyDoTheMath(-g.movementSpeed, 0)
+			g.CpyDoTheMath(g.movementSpeed, 0)
 		case ebiten.KeyJ, ebiten.KeyArrowDown:
 			g.CpyDoTheMath(0, -g.movementSpeed)
 		case ebiten.KeyK, ebiten.KeyArrowUp:
 			g.CpyDoTheMath(0, g.movementSpeed)
 		case ebiten.KeyL, ebiten.KeyArrowRight:
-			g.CpyDoTheMath(g.movementSpeed, 0)
+			g.CpyDoTheMath(-g.movementSpeed, 0)
 		case ebiten.KeyF, ebiten.KeySpace:
 			g.Zoom(ZOOM_DELTA)
 		case ebiten.KeyD, ebiten.KeyBackspace:
@@ -285,10 +287,9 @@ func (g *Game) _DoTheMath(cpy bool, dx, dy int) {
 			complex(float64(-dx)*g.pp.zoomX/GAME_WIDTH,
 				float64(dy)*g.pp.zoomY/GAME_HEIGHT)
 	}
-	leftPoint := g.pp.centre[g.pp.curr] + complex(-g.pp.zoomX/2, g.pp.zoomY/2)
-	deltaX := complex(g.pp.zoomX/(GAME_WIDTH-1), 0)
-	deltaY := complex(0, -g.pp.zoomY/(GAME_HEIGHT-1))
-	deltaCpuY := complex(float64(g.th.nThreads), 0) * deltaY
+	leftUp := g.pp.centre[g.pp.curr] + complex(-g.pp.zoomX/2, g.pp.zoomY/2)
+	deltaX := g.pp.zoomX / (GAME_WIDTH - 1)
+	deltaY := -g.pp.zoomY / (GAME_HEIGHT - 1)
 
 	var xStart, yStart, xEnd, yEnd int
 	if cpy {
@@ -309,14 +310,12 @@ func (g *Game) _DoTheMath(cpy bool, dx, dy int) {
 	}
 
 	g.th.idx = make(chan int, GAME_WIDTH*GAME_HEIGHT+g.th.nThreads)
-	for cpu := 0; cpu < g.th.nThreads; cpu, leftPoint = cpu+1, leftPoint+deltaY {
-		leftPoint := leftPoint
+	for cpu := 0; cpu < g.th.nThreads; cpu = cpu + 1 {
 		cpu := cpu
 		go func() {
 			defer g.th.finishedThread.Done()
-			for i := cpu; i < GAME_HEIGHT; i, leftPoint = i+g.th.nThreads, leftPoint+deltaCpuY {
-				c := leftPoint
-				for j := 0; j < GAME_WIDTH; j, c = j+1, c+deltaX {
+			for i := cpu; i < GAME_HEIGHT; i = i + g.th.nThreads {
+				for j := 0; j < GAME_WIDTH; j++ {
 					// it could be doable without the if, if I could reset to
 					// the previous frame but I don't think it would be enjoiable
 					if !cpy {
@@ -333,7 +332,7 @@ func (g *Game) _DoTheMath(cpy bool, dx, dy int) {
 						prevPoint := &g.pp.dbPoints[1-g.pp.curr][prevIdx]
 						*point = *prevPoint
 					} else {
-						point.c = c
+						point.c = leftUp + complex(float64(j)*deltaX, float64(i)*deltaY)
 						point.z = STARTING_POINT
 						point.steps = 0
 						point.finished = false
