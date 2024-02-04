@@ -1,6 +1,7 @@
 package main
 
 // TODO?: julia set
+// TODO?: ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 
 import (
 	"log"
@@ -36,7 +37,7 @@ const (
 
 // Wikipedia palette
 var (
-	pre_palette []byte = []byte{
+	prePalette []byte = []byte{
 		9, 1, 47, 0xff,
 		4, 4, 73, 0xff,
 		0, 7, 100, 0xff,
@@ -67,31 +68,36 @@ type Mouse struct {
 	x, y      int
 }
 
+type Buffer struct {
+	palette [][]byte
+	updated chan bool
+	content []byte
+}
+
 type ThreadStatus struct {
-	nThreads       int
-	idx            chan int
-	canReset       chan bool
-	stop           chan bool
-	bufChaged      chan bool
-	finishedThread sync.WaitGroup
+	nThreads     int
+	idx          chan int
+	canReload    chan bool
+	haveToStop   chan bool
+	canStart     chan bool
+	workingCount sync.WaitGroup
 }
 
 type DoublePoints struct {
 	zoomX    float64
 	zoomY    float64
 	curr     int
-	centre   [2]complex128
+	dbCentre [2]complex128
 	dbPoints [2][]PointStatus
 }
 
 type Game struct {
-	pp            DoublePoints
+	points        DoublePoints
 	movementSpeed int
 	th            ThreadStatus
 	keys          []ebiten.Key
 	mouse         Mouse
-	palette       [][]byte
-	buf           []byte
+	buf           Buffer
 	image         *ebiten.Image
 }
 
@@ -110,8 +116,8 @@ func (g *Game) Update() error {
 		return err
 	}
 	select {
-	case <-g.th.bufChaged:
-		g.image.WritePixels(g.buf)
+	case <-g.buf.updated:
+		g.image.WritePixels(g.buf.content)
 	default:
 	}
 	return nil
@@ -128,11 +134,11 @@ func (g *Game) Layout(outsideWidth, outsideHeight int) (screenWidth, screenHeigh
 func NewGame() *Game {
 	nThreads := runtime.NumCPU()
 	g := Game{
-		pp: DoublePoints{
-			zoomX:  INITIAL_ZOOM,
-			zoomY:  INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
-			curr:   0,
-			centre: [2]complex128{INITIAL_CENTER, INITIAL_CENTER},
+		points: DoublePoints{
+			zoomX:    INITIAL_ZOOM,
+			zoomY:    INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
+			curr:     0,
+			dbCentre: [2]complex128{INITIAL_CENTER, INITIAL_CENTER},
 			dbPoints: [2][]PointStatus{
 				make([]PointStatus, GAME_WIDTH*GAME_HEIGHT),
 				make([]PointStatus, GAME_WIDTH*GAME_HEIGHT),
@@ -140,53 +146,57 @@ func NewGame() *Game {
 		},
 		movementSpeed: MOVEMENT_SPEED,
 		th: ThreadStatus{
-			nThreads:  nThreads,
-			idx:       make(chan int, nThreads),
-			stop:      make(chan bool, nThreads),
-			canReset:  make(chan bool, 1),
-			bufChaged: make(chan bool, 1),
-			// wg         default
+			nThreads:     nThreads,
+			idx:          make(chan int),
+			haveToStop:   make(chan bool, nThreads),
+			canStart:     make(chan bool, nThreads),
+			canReload:    make(chan bool, 1),
+			workingCount: sync.WaitGroup{},
 		},
-		palette: NewPalette(),
-		buf:     make([]byte, GAME_WIDTH*GAME_HEIGHT*4),
-		image:   ebiten.NewImage(GAME_WIDTH, GAME_HEIGHT),
-		// keys:       default
-		// mouse:      default
+		// keys: default,
+		buf: Buffer{
+			palette: NewPalette(),
+			updated: make(chan bool, 1),
+			content: make([]byte, GAME_WIDTH*GAME_HEIGHT*4),
+		},
+		image: ebiten.NewImage(GAME_WIDTH, GAME_HEIGHT),
+		mouse: Mouse{
+			isPressed: false,
+			// x, y: default,
+		},
 	}
-	go func() {
-		for i := 0; i < g.th.nThreads; i++ {
-			<-g.th.stop
-		}
-	}()
-	g.th.canReset <- true
-	g.DoTheMath()
+	g.th.workingCount.Add(g.th.nThreads)
+	for i := 0; i < g.th.nThreads; i++ {
+		go Worker(&g)
+	}
+	g.th.canReload <- true
+	g.Reload()
 	return &g
 }
 
 func NewPalette() [][]byte {
-	palette := make([][]byte, len(pre_palette)/4)
-	for i := 0; i < len(pre_palette)/4; i++ {
+	palette := make([][]byte, len(prePalette)/4)
+	for i := 0; i < len(prePalette)/4; i++ {
 		palette[i] = make([]byte, 4)
-		palette[i][0] = pre_palette[i*4]
-		palette[i][1] = pre_palette[i*4+1]
-		palette[i][2] = pre_palette[i*4+2]
-		palette[i][3] = pre_palette[i*4+3]
+		palette[i][0] = prePalette[i*4]
+		palette[i][1] = prePalette[i*4+1]
+		palette[i][2] = prePalette[i*4+2]
+		palette[i][3] = prePalette[i*4+3]
 	}
 	return palette
 }
 
 func (g *Game) ReadMouse() {
+	x, y := ebiten.CursorPosition()
 	switch {
 	case inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft):
 		g.mouse.isPressed = true
-		x, y := ebiten.CursorPosition()
 		g.mouse.x, g.mouse.y = x, y
 	case inpututil.IsMouseButtonJustReleased(ebiten.MouseButtonLeft):
 		g.mouse.isPressed = false
 	}
-	x, y := ebiten.CursorPosition()
 	if g.mouse.isPressed && (x != g.mouse.x || y != g.mouse.y) {
-		g.CpyDoTheMath(x-g.mouse.x, y-g.mouse.y)
+		g.PartiallyReload(x-g.mouse.x, y-g.mouse.y)
 	} else {
 		_, dy := ebiten.Wheel()
 		if dy != 0 {
@@ -207,20 +217,20 @@ func (g *Game) ReadKeyboard() error {
 	for _, k := range g.keys {
 		switch k {
 		case ebiten.KeyR:
-			g.pp.centre[g.pp.curr] = INITIAL_CENTER
-			g.pp.zoomX = INITIAL_ZOOM
-			g.pp.zoomY = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
-			g.DoTheMath()
+			g.points.dbCentre[g.points.curr] = INITIAL_CENTER
+			g.points.zoomX = INITIAL_ZOOM
+			g.points.zoomY = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
+			g.Reload()
 		case ebiten.KeyQ:
 			return ebiten.Termination
 		case ebiten.KeyH, ebiten.KeyArrowLeft:
-			g.CpyDoTheMath(g.movementSpeed, 0)
+			g.PartiallyReload(g.movementSpeed, 0)
 		case ebiten.KeyJ, ebiten.KeyArrowDown:
-			g.CpyDoTheMath(0, -g.movementSpeed)
+			g.PartiallyReload(0, -g.movementSpeed)
 		case ebiten.KeyK, ebiten.KeyArrowUp:
-			g.CpyDoTheMath(0, g.movementSpeed)
+			g.PartiallyReload(0, g.movementSpeed)
 		case ebiten.KeyL, ebiten.KeyArrowRight:
-			g.CpyDoTheMath(-g.movementSpeed, 0)
+			g.PartiallyReload(-g.movementSpeed, 0)
 		case ebiten.KeyF, ebiten.KeySpace:
 			g.Zoom(ZOOM_DELTA)
 		case ebiten.KeyD, ebiten.KeyBackspace:
@@ -231,68 +241,71 @@ func (g *Game) ReadKeyboard() error {
 }
 
 func (g *Game) Zoom(zoom float64) {
-	newZoom := g.pp.zoomX * zoom
+	newZoom := g.points.zoomX * zoom
 	if newZoom < MIN_ZOOM {
 		return
 	}
-	g.pp.zoomX = newZoom
-	g.pp.zoomY = newZoom * GAME_HEIGHT / GAME_WIDTH
-	g.DoTheMath()
+	g.points.zoomX = newZoom
+	g.points.zoomY = newZoom * GAME_HEIGHT / GAME_WIDTH
+	g.Reload()
 }
 
 func (g *Game) ZoomFixedMouse(zoom float64, mouseX, mouseY int) {
-	newZoom := g.pp.zoomX * zoom
+	newZoom := g.points.zoomX * zoom
 	if newZoom < MIN_ZOOM {
 		return
 	}
 	fixedPoint := complex(
-		float64(g.mouse.x-GAME_WIDTH/2)*g.pp.zoomX/GAME_WIDTH,
-		float64(-g.mouse.y+GAME_HEIGHT/2)*g.pp.zoomY/GAME_HEIGHT,
+		float64(g.mouse.x-GAME_WIDTH/2)*g.points.zoomX/GAME_WIDTH,
+		float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY/GAME_HEIGHT,
 	)
-	g.pp.zoomX = newZoom
-	g.pp.zoomY = newZoom * GAME_HEIGHT / GAME_WIDTH
+	g.points.zoomX = newZoom
+	g.points.zoomY = newZoom * GAME_HEIGHT / GAME_WIDTH
 	delta := fixedPoint - complex(
-		float64(g.mouse.x-GAME_WIDTH/2)*g.pp.zoomX/GAME_WIDTH,
-		float64(-g.mouse.y+GAME_HEIGHT/2)*g.pp.zoomY/GAME_HEIGHT,
+		float64(g.mouse.x-GAME_WIDTH/2)*g.points.zoomX/GAME_WIDTH,
+		float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY/GAME_HEIGHT,
 	)
-	g.pp.centre[g.pp.curr] += delta
-	g.DoTheMath()
+	g.points.dbCentre[g.points.curr] += delta
+	g.Reload()
 }
 
-func (g *Game) DoTheMath() {
-	g._DoTheMath(false, 42, 42)
+func (g *Game) Reload() {
+	g.DoTheMath(42, 42, false)
 }
 
-func (g *Game) CpyDoTheMath(dx, dy int) {
-	g._DoTheMath(true, dx, dy)
+func (g *Game) PartiallyReload(dx, dy int) {
+	g.DoTheMath(dx, dy, true)
 }
 
-func (g *Game) _DoTheMath(cpy bool, dx, dy int) {
+func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
 	select {
-	case <-g.th.canReset:
+	case <-g.th.canReload:
+		defer func() {
+			g.th.canReload <- true
+		}()
 	default:
 		return
 	}
 	for cpu := 0; cpu < g.th.nThreads; cpu++ {
-		g.th.stop <- true
+		g.th.haveToStop <- true
 	}
-	g.th.finishedThread.Wait()
+	g.th.workingCount.Wait()
+	defer g.th.workingCount.Add(g.th.nThreads)
 	close(g.th.idx)
-	g.th.finishedThread.Add(g.th.nThreads)
-	g.th.canReset <- true
+	g.th.idx = make(chan int, GAME_WIDTH*GAME_HEIGHT)
 
-	if cpy {
-		g.pp.curr = 1 - g.pp.curr
-		g.pp.centre[g.pp.curr] = g.pp.centre[1-g.pp.curr] +
-			complex(float64(-dx)*g.pp.zoomX/GAME_WIDTH,
-				float64(dy)*g.pp.zoomY/GAME_HEIGHT)
+	if cpyFlag {
+		g.points.curr = 1 - g.points.curr
+		g.points.dbCentre[g.points.curr] = g.points.dbCentre[1-g.points.curr] +
+			complex(float64(-dx)*g.points.zoomX/GAME_WIDTH,
+				float64(dy)*g.points.zoomY/GAME_HEIGHT)
 	}
-	leftUp := g.pp.centre[g.pp.curr] + complex(-g.pp.zoomX/2, g.pp.zoomY/2)
-	deltaX := g.pp.zoomX / (GAME_WIDTH - 1)
-	deltaY := -g.pp.zoomY / (GAME_HEIGHT - 1)
+	leftUp := g.points.dbCentre[g.points.curr] + complex(-g.points.zoomX/2, g.points.zoomY/2)
+	deltaX := g.points.zoomX / (GAME_WIDTH - 1)
+	deltaY := -g.points.zoomY / (GAME_HEIGHT - 1)
 
 	var xStart, yStart, xEnd, yEnd int
-	if cpy {
+	if cpyFlag {
 		if dx > 0 {
 			xStart = dx
 			xEnd = GAME_WIDTH
@@ -309,27 +322,28 @@ func (g *Game) _DoTheMath(cpy bool, dx, dy int) {
 		}
 	}
 
-	g.th.idx = make(chan int, GAME_WIDTH*GAME_HEIGHT+g.th.nThreads)
 	for cpu := 0; cpu < g.th.nThreads; cpu = cpu + 1 {
 		cpu := cpu
 		go func() {
-			defer g.th.finishedThread.Done()
 			for i := cpu; i < GAME_HEIGHT; i = i + g.th.nThreads {
 				for j := 0; j < GAME_WIDTH; j++ {
-					// it could be doable without the if, if I could reset to
-					// the previous frame but I don't think it would be enjoiable
-					if !cpy {
+					// it could be doable without the if, if tha game could reset
+					// to the previous frame but I don't think it would be enjoiable
+					// to not see anything drawn while dragging the mouse
+					// maybe it is better a little lag
+					if !cpyFlag {
 						select {
-						case <-g.th.stop:
+						case <-g.th.haveToStop:
+							g.th.workingCount.Done()
 							return
 						default:
 						}
 					}
 					idx := i*GAME_WIDTH + j
-					point := &g.pp.dbPoints[g.pp.curr][idx]
+					point := &g.points.dbPoints[g.points.curr][idx]
 					if (yStart <= i && i < yEnd) && (xStart <= j && j < xEnd) {
 						prevIdx := (i-dy)*GAME_WIDTH + (j - dx)
-						prevPoint := &g.pp.dbPoints[1-g.pp.curr][prevIdx]
+						prevPoint := &g.points.dbPoints[1-g.points.curr][prevIdx]
 						*point = *prevPoint
 					} else {
 						point.c = leftUp + complex(float64(j)*deltaX, float64(i)*deltaY)
@@ -343,7 +357,7 @@ func (g *Game) _DoTheMath(cpy bool, dx, dy int) {
 					}
 				}
 			}
-			Worker(g)
+			g.th.canStart <- true
 		}()
 	}
 }
@@ -351,11 +365,12 @@ func (g *Game) _DoTheMath(cpy bool, dx, dy int) {
 func Worker(g *Game) {
 	for {
 		select {
-		case <-g.th.stop:
-			return
+		case <-g.th.haveToStop:
+			g.th.workingCount.Done()
+			<-g.th.canStart
 		case idx := <-g.th.idx:
-			point := &g.pp.dbPoints[g.pp.curr][idx]
-			z, stepDone := EscapeStep(point.c, point.z, DELTA_STEP)
+			point := &g.points.dbPoints[g.points.curr][idx]
+			z, stepDone := EscapeSteps(point.c, point.z, DELTA_STEP)
 			point.z = z
 			if stepDone == -1 {
 				point.steps += DELTA_STEP
@@ -368,14 +383,14 @@ func Worker(g *Game) {
 			point.finished = true
 			g.WriteToBuffer(idx, point.steps)
 			select {
-			case g.th.bufChaged <- true:
+			case g.buf.updated <- true:
 			default:
 			}
 		}
 	}
 }
 
-func EscapeStep(c, z complex128, maxStep int) (complex128, int) {
+func EscapeSteps(c, z complex128, maxStep int) (complex128, int) {
 	for i := 0; i < maxStep; i++ {
 		z = z*z + c
 		if real(z)*real(z)+imag(z)*imag(z) > THRESHOLD*THRESHOLD {
@@ -386,11 +401,11 @@ func EscapeStep(c, z complex128, maxStep int) (complex128, int) {
 }
 
 func (g *Game) WriteToBuffer(idx, s int) {
-	buf := &g.buf
-	pal := &g.palette[s%len(g.palette)]
+	content := &g.buf.content
+	pal := &g.buf.palette[s%len(g.buf.palette)]
 	idx *= 4
-	(*buf)[idx] = (*pal)[0]
-	(*buf)[idx+1] = (*pal)[1]
-	(*buf)[idx+2] = (*pal)[2]
-	(*buf)[idx+3] = (*pal)[3]
+	(*content)[idx] = (*pal)[0]
+	(*content)[idx+1] = (*pal)[1]
+	(*content)[idx+2] = (*pal)[2]
+	(*content)[idx+3] = (*pal)[3]
 }
