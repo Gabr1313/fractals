@@ -172,7 +172,7 @@ func NewGame() *Game {
 		go Worker(&g)
 	}
 	g.th.canReload <- true
-	g.Reload()
+	g.ReloadLeft(1)
 	return &g
 }
 
@@ -198,7 +198,7 @@ func (g *Game) ReadMouse() {
 		g.mouse.isPressed = false
 	}
 	if g.mouse.isPressed && (x != g.mouse.x || y != g.mouse.y) {
-		g.PartiallyReload(x-g.mouse.x, y-g.mouse.y)
+		g.PartiallyReloadLeft(1, x-g.mouse.x, y-g.mouse.y)
 	} else {
 		_, dy := ebiten.Wheel()
 		if dy != 0 {
@@ -208,7 +208,7 @@ func (g *Game) ReadMouse() {
 			} else {
 				zoom = MOUSE_WHEEL_SPEED / ZOOM_DELTA
 			}
-			g.ZoomFixedMouse(zoom, x, y)
+			g.ZoomFixedMouse(1, zoom, x, y)
 		}
 	}
 	g.mouse.x, g.mouse.y = x, y
@@ -222,64 +222,66 @@ func (g *Game) ReadKeyboard() error {
 			g.points.dbCentre[g.points.curr] = INITIAL_CENTER
 			g.points.zoomX = INITIAL_ZOOM
 			g.points.zoomY = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
-			g.Reload()
+			// g.ReloadLeft(0)
+			g.ReloadLeft(1)
 		case ebiten.KeyQ:
 			return ebiten.Termination
 		case ebiten.KeyH, ebiten.KeyArrowLeft:
-			g.PartiallyReload(g.movementSpeed, 0)
+			g.PartiallyReloadLeft(1, g.movementSpeed, 0)
 		case ebiten.KeyJ, ebiten.KeyArrowDown:
-			g.PartiallyReload(0, -g.movementSpeed)
+			g.PartiallyReloadLeft(1, 0, -g.movementSpeed)
 		case ebiten.KeyK, ebiten.KeyArrowUp:
-			g.PartiallyReload(0, g.movementSpeed)
+			g.PartiallyReloadLeft(1, 0, g.movementSpeed)
 		case ebiten.KeyL, ebiten.KeyArrowRight:
-			g.PartiallyReload(-g.movementSpeed, 0)
+			g.PartiallyReloadLeft(1, -g.movementSpeed, 0)
 		case ebiten.KeyF, ebiten.KeySpace:
-			g.Zoom(ZOOM_DELTA)
+			g.Zoom(1, ZOOM_DELTA)
 		case ebiten.KeyD, ebiten.KeyBackspace:
-			g.Zoom(1 / ZOOM_DELTA)
+			g.Zoom(1, 1/ZOOM_DELTA)
 		}
 	}
 	return nil
 }
 
-func (g *Game) Zoom(zoom float64) {
+func (g *Game) Zoom(screenNumber int, zoom float64) {
 	newZoom := g.points.zoomX * zoom
 	if newZoom < MIN_ZOOM {
 		return
 	}
 	g.points.zoomX = newZoom
 	g.points.zoomY = newZoom * GAME_HEIGHT / GAME_WIDTH
-	g.Reload()
+	g.ReloadLeft(screenNumber)
 }
 
-func (g *Game) ZoomFixedMouse(zoom float64, mouseX, mouseY int) {
+func (g *Game) ZoomFixedMouse(screenNumber int, zoom float64, mouseX, mouseY int) {
+	displacement := Displacement(screenNumber)
 	newZoom := g.points.zoomX * zoom
 	if newZoom < MIN_ZOOM {
 		return
 	}
 	fixedPoint := complex(
-		float64(g.mouse.x-GAME_WIDTH/2)*g.points.zoomX/GAME_WIDTH,
+		float64(g.mouse.x-(GAME_WIDTH)/2-displacement)*g.points.zoomX/GAME_WIDTH,
 		float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY/GAME_HEIGHT,
 	)
 	g.points.zoomX = newZoom
 	g.points.zoomY = newZoom * GAME_HEIGHT / GAME_WIDTH
 	delta := fixedPoint - complex(
-		float64(g.mouse.x-GAME_WIDTH/2)*g.points.zoomX/GAME_WIDTH,
+		float64(g.mouse.x-(GAME_WIDTH)/2-displacement)*g.points.zoomX/GAME_WIDTH,
 		float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY/GAME_HEIGHT,
 	)
 	g.points.dbCentre[g.points.curr] += delta
-	g.Reload()
+	g.ReloadLeft(1)
 }
 
-func (g *Game) Reload() {
-	g.DoTheMath(42, 42, false)
+func (g *Game) ReloadLeft(screenNumber int) {
+	g.DoTheMath(screenNumber, 42, 42, false)
 }
 
-func (g *Game) PartiallyReload(dx, dy int) {
-	g.DoTheMath(dx, dy, true)
+func (g *Game) PartiallyReloadLeft(screenNumber int, dx, dy int) {
+	g.DoTheMath(screenNumber, dx, dy, true)
 }
 
-func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
+func (g *Game) DoTheMath(screenNumber int, dx, dy int, cpyFlag bool) {
 	select {
 	case <-g.th.canReload:
 		defer func() {
@@ -324,10 +326,11 @@ func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
 		}
 	}
 
+	displacement := Displacement(screenNumber)
 	for cpu := 0; cpu < g.th.nThreads; cpu = cpu + 1 {
-		cpu := cpu
+		minI := cpu
 		go func() {
-			for i := cpu; i < GAME_HEIGHT; i = i + g.th.nThreads {
+			for i := minI; i < GAME_HEIGHT; i = i + g.th.nThreads {
 				for j := 0; j < GAME_WIDTH; j++ {
 					// it could be doable without the if, if tha game could reset
 					// to the previous frame but I don't think it would be enjoiable
@@ -341,10 +344,10 @@ func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
 						default:
 						}
 					}
-					idx := i*DB_GAME_WIDTH + j
+					idx := i*DB_GAME_WIDTH + j + displacement
 					point := &g.points.dbPoints[g.points.curr][idx]
 					if (yStart <= i && i < yEnd) && (xStart <= j && j < xEnd) {
-						prevIdx := (i-dy)*DB_GAME_WIDTH + (j - dx)
+						prevIdx := (i-dy)*DB_GAME_WIDTH + (j - dx) + displacement
 						prevPoint := &g.points.dbPoints[1-g.points.curr][prevIdx]
 						*point = *prevPoint
 					} else {
@@ -410,4 +413,11 @@ func (g *Game) WriteToBuffer(idx, s int) {
 	(*content)[idx+1] = (*pal)[1]
 	(*content)[idx+2] = (*pal)[2]
 	(*content)[idx+3] = (*pal)[3]
+}
+
+func Displacement(screenNumber int) int {
+	if screenNumber != 0 {
+		return GAME_WIDTH
+	}
+	return 0
 }
