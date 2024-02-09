@@ -172,7 +172,7 @@ func NewGame() *Game {
 		go Worker(&g)
 	}
 	g.th.canReload <- true
-	g.ReloadLeft(1)
+	g.ReloadLeft(0)
 	return &g
 }
 
@@ -198,7 +198,7 @@ func (g *Game) ReadMouse() {
 		g.mouse.isPressed = false
 	}
 	if g.mouse.isPressed && (x != g.mouse.x || y != g.mouse.y) {
-		g.PartiallyReloadLeft(1, x-g.mouse.x, y-g.mouse.y)
+		g.PartiallyReloadLeft(0, x-g.mouse.x, y-g.mouse.y)
 	} else {
 		_, dy := ebiten.Wheel()
 		if dy != 0 {
@@ -208,7 +208,7 @@ func (g *Game) ReadMouse() {
 			} else {
 				zoom = MOUSE_WHEEL_SPEED / ZOOM_DELTA
 			}
-			g.ZoomFixedMouse(1, zoom, x, y)
+			g.ZoomFixedMouse(0, zoom, x, y)
 		}
 	}
 	g.mouse.x, g.mouse.y = x, y
@@ -222,22 +222,22 @@ func (g *Game) ReadKeyboard() error {
 			g.points.dbCentre[g.points.curr] = INITIAL_CENTER
 			g.points.zoomX = INITIAL_ZOOM
 			g.points.zoomY = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
-			// g.ReloadLeft(0)
-			g.ReloadLeft(1)
+			g.ReloadLeft(0)
+			// g.ReloadLeft(1)
 		case ebiten.KeyQ:
 			return ebiten.Termination
 		case ebiten.KeyH, ebiten.KeyArrowLeft:
-			g.PartiallyReloadLeft(1, g.movementSpeed, 0)
+			g.PartiallyReloadLeft(0, g.movementSpeed, 0)
 		case ebiten.KeyJ, ebiten.KeyArrowDown:
-			g.PartiallyReloadLeft(1, 0, -g.movementSpeed)
+			g.PartiallyReloadLeft(0, 0, -g.movementSpeed)
 		case ebiten.KeyK, ebiten.KeyArrowUp:
-			g.PartiallyReloadLeft(1, 0, g.movementSpeed)
+			g.PartiallyReloadLeft(0, 0, g.movementSpeed)
 		case ebiten.KeyL, ebiten.KeyArrowRight:
-			g.PartiallyReloadLeft(1, -g.movementSpeed, 0)
+			g.PartiallyReloadLeft(0, -g.movementSpeed, 0)
 		case ebiten.KeyF, ebiten.KeySpace:
-			g.Zoom(1, ZOOM_DELTA)
+			g.Zoom(0, ZOOM_DELTA)
 		case ebiten.KeyD, ebiten.KeyBackspace:
-			g.Zoom(1, 1/ZOOM_DELTA)
+			g.Zoom(0, 1/ZOOM_DELTA)
 		}
 	}
 	return nil
@@ -270,7 +270,7 @@ func (g *Game) ZoomFixedMouse(screenNumber int, zoom float64, mouseX, mouseY int
 		float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY/GAME_HEIGHT,
 	)
 	g.points.dbCentre[g.points.curr] += delta
-	g.ReloadLeft(1)
+	g.ReloadLeft(screenNumber)
 }
 
 func (g *Game) ReloadLeft(screenNumber int) {
