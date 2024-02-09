@@ -29,10 +29,12 @@ const (
 	MOVEMENT_SPEED    = SCREEN_WIDTH / 50
 
 	// below values should not be changed
-	GAME_WIDTH  = SCREEN_WIDTH * SQRT_DOTS_PER_PIXEL
-	GAME_HEIGHT = SCREEN_HEIGHT * SQRT_DOTS_PER_PIXEL
-	THRESHOLD   = float64(2)
-	MIN_ZOOM    = 2.5e-13
+	DB_SCREEN_WIDTH = 720 * 2
+	DB_GAME_WIDTH   = DB_SCREEN_WIDTH * SQRT_DOTS_PER_PIXEL
+	GAME_WIDTH      = SCREEN_WIDTH * SQRT_DOTS_PER_PIXEL
+	GAME_HEIGHT     = SCREEN_HEIGHT * SQRT_DOTS_PER_PIXEL
+	THRESHOLD       = float64(2)
+	MIN_ZOOM        = 2.5e-13
 )
 
 // Wikipedia palette
@@ -102,7 +104,7 @@ type Game struct {
 }
 
 func main() {
-	ebiten.SetWindowSize(SCREEN_WIDTH, SCREEN_HEIGHT)
+	ebiten.SetWindowSize(DB_SCREEN_WIDTH, SCREEN_HEIGHT)
 	ebiten.SetWindowTitle("Mandelbrot set")
 	if err := ebiten.RunGame(NewGame()); err != nil {
 		log.Fatal(err)
@@ -128,7 +130,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 }
 
 func (g *Game) Layout(outsideWidth, outsideHeight int) (screenWidth, screenHeight int) {
-	return GAME_WIDTH, GAME_HEIGHT
+	return DB_GAME_WIDTH, GAME_HEIGHT
 }
 
 func NewGame() *Game {
@@ -140,8 +142,8 @@ func NewGame() *Game {
 			curr:     0,
 			dbCentre: [2]complex128{INITIAL_CENTER, INITIAL_CENTER},
 			dbPoints: [2][]PointStatus{
-				make([]PointStatus, GAME_WIDTH*GAME_HEIGHT),
-				make([]PointStatus, GAME_WIDTH*GAME_HEIGHT),
+				make([]PointStatus, DB_GAME_WIDTH*GAME_HEIGHT),
+				make([]PointStatus, DB_GAME_WIDTH*GAME_HEIGHT),
 			},
 		},
 		movementSpeed: MOVEMENT_SPEED,
@@ -157,9 +159,9 @@ func NewGame() *Game {
 		buf: Buffer{
 			palette: NewPalette(),
 			updated: make(chan bool, 1),
-			content: make([]byte, GAME_WIDTH*GAME_HEIGHT*4),
+			content: make([]byte, DB_GAME_WIDTH*GAME_HEIGHT*4),
 		},
-		image: ebiten.NewImage(GAME_WIDTH, GAME_HEIGHT),
+		image: ebiten.NewImage(DB_GAME_WIDTH, GAME_HEIGHT),
 		mouse: Mouse{
 			isPressed: false,
 			// x, y: default,
@@ -339,10 +341,10 @@ func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
 						default:
 						}
 					}
-					idx := i*GAME_WIDTH + j
+					idx := i*DB_GAME_WIDTH + j
 					point := &g.points.dbPoints[g.points.curr][idx]
 					if (yStart <= i && i < yEnd) && (xStart <= j && j < xEnd) {
-						prevIdx := (i-dy)*GAME_WIDTH + (j - dx)
+						prevIdx := (i-dy)*DB_GAME_WIDTH + (j - dx)
 						prevPoint := &g.points.dbPoints[1-g.points.curr][prevIdx]
 						*point = *prevPoint
 					} else {
