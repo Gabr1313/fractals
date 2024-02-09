@@ -20,7 +20,8 @@ const (
 
 	// INITIAL_CENTER = complex(0, 1)
 	// INITIAL_ZOOM   = 2.5e-13
-	INITIAL_CENTER    = complex(-.75, 0)
+	INITIAL_CENTER_0  = complex(-.75, 0)
+	INITIAL_CENTER_1  = complex(0, 0)
 	INITIAL_ZOOM      = 2.5e-0
 	DELTA_STEP        = 1024
 	MAX_STEP          = DELTA_STEP * 8
@@ -78,19 +79,25 @@ type Buffer struct {
 
 type ThreadStatus struct {
 	nThreads     int
-	idx          chan int
-	canReload    chan bool
+	idx0         chan int
+	idx1         chan int
+	canReload0   chan bool
+	canReload1   chan bool
 	haveToStop   chan bool
 	canStart     chan bool
 	workingCount sync.WaitGroup
 }
 
 type DoublePoints struct {
-	zoomX    float64
-	zoomY    float64
-	curr     int
-	dbCentre [2]complex128
-	dbPoints [2][]PointStatus
+	zoomX0    float64
+	zoomY0    float64
+	zoomX1    float64
+	zoomY1    float64
+	curr0     int
+	curr1     int
+	dbCentre0 [2]complex128
+	dbCentre1 [2]complex128
+	dbPoints  [2][]PointStatus
 }
 
 type Game struct {
@@ -100,6 +107,7 @@ type Game struct {
 	keys          []ebiten.Key
 	mouse         Mouse
 	buf           Buffer
+	currentScreen int
 	image         *ebiten.Image
 }
 
@@ -137,10 +145,14 @@ func NewGame() *Game {
 	nThreads := runtime.NumCPU()
 	g := Game{
 		points: DoublePoints{
-			zoomX:    INITIAL_ZOOM,
-			zoomY:    INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
-			curr:     0,
-			dbCentre: [2]complex128{INITIAL_CENTER, INITIAL_CENTER},
+			zoomX0:    INITIAL_ZOOM,
+			zoomY0:    INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
+			zoomX1:    INITIAL_ZOOM,
+			zoomY1:    INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
+			curr0:     0,
+			curr1:     0,
+			dbCentre0: [2]complex128{INITIAL_CENTER_0, INITIAL_CENTER_0},
+			dbCentre1: [2]complex128{INITIAL_CENTER_1, INITIAL_CENTER_1},
 			dbPoints: [2][]PointStatus{
 				make([]PointStatus, DB_GAME_WIDTH*GAME_HEIGHT),
 				make([]PointStatus, DB_GAME_WIDTH*GAME_HEIGHT),
@@ -149,10 +161,12 @@ func NewGame() *Game {
 		movementSpeed: MOVEMENT_SPEED,
 		th: ThreadStatus{
 			nThreads:     nThreads,
-			idx:          make(chan int),
+			idx0:         make(chan int),
+			idx1:         make(chan int),
 			haveToStop:   make(chan bool, nThreads),
 			canStart:     make(chan bool, nThreads),
-			canReload:    make(chan bool, 1),
+			canReload0:   make(chan bool, 1),
+			canReload1:   make(chan bool, 1),
 			workingCount: sync.WaitGroup{},
 		},
 		// keys: default,
@@ -171,8 +185,12 @@ func NewGame() *Game {
 	for i := 0; i < g.th.nThreads; i++ {
 		go Worker(&g)
 	}
-	g.th.canReload <- true
-	g.ReloadLeft(0)
+	g.th.canReload1 <- true
+	g.currentScreen = 1
+	g.Reload()
+	g.th.canReload0 <- true
+	g.currentScreen = 0
+	g.Reload()
 	return &g
 }
 
@@ -198,8 +216,13 @@ func (g *Game) ReadMouse() {
 		g.mouse.isPressed = false
 	}
 	if g.mouse.isPressed && (x != g.mouse.x || y != g.mouse.y) {
-		g.PartiallyReloadLeft(0, x-g.mouse.x, y-g.mouse.y)
+		g.PartiallyReload(x-g.mouse.x, y-g.mouse.y)
 	} else {
+		if x > GAME_WIDTH {
+			g.currentScreen = 1
+		} else {
+			g.currentScreen = 0
+		}
 		_, dy := ebiten.Wheel()
 		if dy != 0 {
 			var zoom float64
@@ -208,7 +231,7 @@ func (g *Game) ReadMouse() {
 			} else {
 				zoom = MOUSE_WHEEL_SPEED / ZOOM_DELTA
 			}
-			g.ZoomFixedMouse(0, zoom, x, y)
+			g.ZoomFixedMouse(zoom, x, y)
 		}
 	}
 	g.mouse.x, g.mouse.y = x, y
@@ -219,94 +242,158 @@ func (g *Game) ReadKeyboard() error {
 	for _, k := range g.keys {
 		switch k {
 		case ebiten.KeyR:
-			g.points.dbCentre[g.points.curr] = INITIAL_CENTER
-			g.points.zoomX = INITIAL_ZOOM
-			g.points.zoomY = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
-			g.ReloadLeft(0)
-			// g.ReloadLeft(1)
+			if g.currentScreen == 0 {
+				g.points.dbCentre0[g.points.curr0] = INITIAL_CENTER_0
+				g.points.zoomX0 = INITIAL_ZOOM
+				g.points.zoomY0 = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
+			} else {
+				g.points.dbCentre1[g.points.curr1] = INITIAL_CENTER_1
+				g.points.zoomX1 = INITIAL_ZOOM
+				g.points.zoomY1 = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
+			}
+			g.Reload()
 		case ebiten.KeyQ:
 			return ebiten.Termination
 		case ebiten.KeyH, ebiten.KeyArrowLeft:
-			g.PartiallyReloadLeft(0, g.movementSpeed, 0)
+			g.PartiallyReload(g.movementSpeed, 0)
 		case ebiten.KeyJ, ebiten.KeyArrowDown:
-			g.PartiallyReloadLeft(0, 0, -g.movementSpeed)
+			g.PartiallyReload(0, -g.movementSpeed)
 		case ebiten.KeyK, ebiten.KeyArrowUp:
-			g.PartiallyReloadLeft(0, 0, g.movementSpeed)
+			g.PartiallyReload(0, g.movementSpeed)
 		case ebiten.KeyL, ebiten.KeyArrowRight:
-			g.PartiallyReloadLeft(0, -g.movementSpeed, 0)
+			g.PartiallyReload(-g.movementSpeed, 0)
 		case ebiten.KeyF, ebiten.KeySpace:
-			g.Zoom(0, ZOOM_DELTA)
+			g.Zoom(ZOOM_DELTA)
 		case ebiten.KeyD, ebiten.KeyBackspace:
-			g.Zoom(0, 1/ZOOM_DELTA)
+			g.Zoom(1 / ZOOM_DELTA)
 		}
 	}
 	return nil
 }
 
-func (g *Game) Zoom(screenNumber int, zoom float64) {
-	newZoom := g.points.zoomX * zoom
-	if newZoom < MIN_ZOOM {
-		return
+func (g *Game) Zoom(zoom float64) {
+	if g.currentScreen == 0 {
+		newZoom := g.points.zoomX0 * zoom
+		if newZoom < MIN_ZOOM {
+			return
+		}
+		g.points.zoomX0 = newZoom
+		g.points.zoomY0 = newZoom * GAME_HEIGHT / GAME_WIDTH
+	} else {
+		newZoom := g.points.zoomX1 * zoom
+		if newZoom < MIN_ZOOM {
+			return
+		}
+		g.points.zoomX1 = newZoom
+		g.points.zoomY1 = newZoom * GAME_HEIGHT / GAME_WIDTH
 	}
-	g.points.zoomX = newZoom
-	g.points.zoomY = newZoom * GAME_HEIGHT / GAME_WIDTH
-	g.ReloadLeft(screenNumber)
+	g.Reload()
 }
 
-func (g *Game) ZoomFixedMouse(screenNumber int, zoom float64, mouseX, mouseY int) {
-	displacement := Displacement(screenNumber)
-	newZoom := g.points.zoomX * zoom
-	if newZoom < MIN_ZOOM {
-		return
+func (g *Game) ZoomFixedMouse(zoom float64, mouseX, mouseY int) {
+	displacement := Displacement(g.currentScreen)
+	if g.currentScreen == 0 {
+		newZoom := g.points.zoomX0 * zoom
+		if newZoom < MIN_ZOOM {
+			return
+		}
+		fixedPoint := complex(
+			float64(g.mouse.x-(GAME_WIDTH)/2-displacement)*g.points.zoomX0/GAME_WIDTH,
+			float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY0/GAME_HEIGHT,
+		)
+		g.points.zoomX0 = newZoom
+		g.points.zoomY0 = newZoom * GAME_HEIGHT / GAME_WIDTH
+		delta := fixedPoint - complex(
+			float64(g.mouse.x-(GAME_WIDTH)/2-displacement)*g.points.zoomX0/GAME_WIDTH,
+			float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY0/GAME_HEIGHT,
+		)
+		g.points.dbCentre0[g.points.curr0] += delta
+	} else {
+		newZoom := g.points.zoomX1 * zoom
+		if newZoom < MIN_ZOOM {
+			return
+		}
+		fixedPoint := complex(
+			float64(g.mouse.x-(GAME_WIDTH)/2-displacement)*g.points.zoomX1/GAME_WIDTH,
+			float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY1/GAME_HEIGHT,
+		)
+		g.points.zoomX1 = newZoom
+		g.points.zoomY1 = newZoom * GAME_HEIGHT / GAME_WIDTH
+		delta := fixedPoint - complex(
+			float64(g.mouse.x-(GAME_WIDTH)/2-displacement)*g.points.zoomX1/GAME_WIDTH,
+			float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY1/GAME_HEIGHT,
+		)
+		g.points.dbCentre1[g.points.curr1] += delta
 	}
-	fixedPoint := complex(
-		float64(g.mouse.x-(GAME_WIDTH)/2-displacement)*g.points.zoomX/GAME_WIDTH,
-		float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY/GAME_HEIGHT,
-	)
-	g.points.zoomX = newZoom
-	g.points.zoomY = newZoom * GAME_HEIGHT / GAME_WIDTH
-	delta := fixedPoint - complex(
-		float64(g.mouse.x-(GAME_WIDTH)/2-displacement)*g.points.zoomX/GAME_WIDTH,
-		float64(-g.mouse.y+GAME_HEIGHT/2)*g.points.zoomY/GAME_HEIGHT,
-	)
-	g.points.dbCentre[g.points.curr] += delta
-	g.ReloadLeft(screenNumber)
+	g.Reload()
 }
 
-func (g *Game) ReloadLeft(screenNumber int) {
-	g.DoTheMath(screenNumber, 42, 42, false)
+func (g *Game) Reload() {
+	g.DoTheMath(42, 42, false)
 }
 
-func (g *Game) PartiallyReloadLeft(screenNumber int, dx, dy int) {
-	g.DoTheMath(screenNumber, dx, dy, true)
+func (g *Game) PartiallyReload(dx, dy int) {
+	g.DoTheMath(dx, dy, true)
 }
 
-func (g *Game) DoTheMath(screenNumber int, dx, dy int, cpyFlag bool) {
-	select {
-	case <-g.th.canReload:
-		defer func() {
-			g.th.canReload <- true
-		}()
-	default:
-		return
+func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
+	currentScreen := g.currentScreen
+	if currentScreen == 0 {
+		select {
+		case <-g.th.canReload0:
+			defer func() {
+				g.th.canReload0 <- true
+			}()
+		default:
+			return
+		}
+	} else {
+		select {
+		case <-g.th.canReload1:
+			defer func() {
+				g.th.canReload1 <- true
+			}()
+		default:
+			return
+		}
 	}
 	for cpu := 0; cpu < g.th.nThreads; cpu++ {
 		g.th.haveToStop <- true
 	}
 	g.th.workingCount.Wait()
 	defer g.th.workingCount.Add(g.th.nThreads)
-	close(g.th.idx)
-	g.th.idx = make(chan int, GAME_WIDTH*GAME_HEIGHT)
-
-	if cpyFlag {
-		g.points.curr = 1 - g.points.curr
-		g.points.dbCentre[g.points.curr] = g.points.dbCentre[1-g.points.curr] +
-			complex(float64(-dx)*g.points.zoomX/GAME_WIDTH,
-				float64(dy)*g.points.zoomY/GAME_HEIGHT)
+	if currentScreen == 0 {
+		close(g.th.idx0)
+		g.th.idx0 = make(chan int, GAME_WIDTH*GAME_HEIGHT)
+	} else {
+		close(g.th.idx1)
+		g.th.idx1 = make(chan int, GAME_WIDTH*GAME_HEIGHT)
 	}
-	leftUp := g.points.dbCentre[g.points.curr] + complex(-g.points.zoomX/2, g.points.zoomY/2)
-	deltaX := g.points.zoomX / (GAME_WIDTH - 1)
-	deltaY := -g.points.zoomY / (GAME_HEIGHT - 1)
+
+	var leftUp complex128
+	var deltaX float64
+	var deltaY float64
+	if currentScreen == 0 {
+		if cpyFlag {
+			g.points.curr0 = 1 - g.points.curr0
+			g.points.dbCentre0[g.points.curr0] = g.points.dbCentre0[1-g.points.curr0] +
+				complex(float64(-dx)*g.points.zoomX0/GAME_WIDTH,
+					float64(dy)*g.points.zoomY0/GAME_HEIGHT)
+		}
+		leftUp = g.points.dbCentre0[g.points.curr0] + complex(-g.points.zoomX0/2, g.points.zoomY0/2)
+		deltaX = g.points.zoomX0 / (GAME_WIDTH - 1)
+		deltaY = -g.points.zoomY0 / (GAME_HEIGHT - 1)
+	} else {
+		if cpyFlag {
+			g.points.curr1 = 1 - g.points.curr1
+			g.points.dbCentre1[g.points.curr1] = g.points.dbCentre1[1-g.points.curr1] +
+				complex(float64(-dx)*g.points.zoomX1/GAME_WIDTH,
+					float64(dy)*g.points.zoomY1/GAME_HEIGHT)
+		}
+		leftUp = g.points.dbCentre1[g.points.curr1] + complex(-g.points.zoomX1/2, g.points.zoomY1/2)
+		deltaX = g.points.zoomX1 / (GAME_WIDTH - 1)
+		deltaY = -g.points.zoomY1 / (GAME_HEIGHT - 1)
+	}
 
 	var xStart, yStart, xEnd, yEnd int
 	if cpyFlag {
@@ -326,39 +413,59 @@ func (g *Game) DoTheMath(screenNumber int, dx, dy int, cpyFlag bool) {
 		}
 	}
 
-	displacement := Displacement(screenNumber)
+	displacement := Displacement(currentScreen)
 	for cpu := 0; cpu < g.th.nThreads; cpu = cpu + 1 {
 		minI := cpu
 		go func() {
 			for i := minI; i < GAME_HEIGHT; i = i + g.th.nThreads {
 				for j := 0; j < GAME_WIDTH; j++ {
+					// maybe not anymore... @todo
 					// it could be doable without the if, if tha game could reset
 					// to the previous frame but I don't think it would be enjoiable
 					// to not see anything drawn while dragging the mouse
 					// maybe it is better a little lag
-					if !cpyFlag {
-						select {
-						case <-g.th.haveToStop:
-							g.th.workingCount.Done()
-							return
-						default:
+					// if !cpyFlag {
+					// 	select {
+					// 	case <-g.th.haveToStop:
+					// 		g.th.workingCount.Done()
+					// 		return
+					// 	default:
+					// 	}
+					// }
+					if currentScreen == 0 {
+						idx := i*DB_GAME_WIDTH + j + displacement
+						point := &g.points.dbPoints[g.points.curr0][idx]
+						if (yStart <= i && i < yEnd) && (xStart <= j && j < xEnd) {
+							prevIdx := (i-dy)*DB_GAME_WIDTH + (j - dx) + displacement
+							prevPoint := &g.points.dbPoints[1-g.points.curr0][prevIdx]
+							*point = *prevPoint
+						} else {
+							point.c = leftUp + complex(float64(j)*deltaX, float64(i)*deltaY)
+							point.z = STARTING_POINT
+							point.steps = 0
+							point.finished = false
 						}
-					}
-					idx := i*DB_GAME_WIDTH + j + displacement
-					point := &g.points.dbPoints[g.points.curr][idx]
-					if (yStart <= i && i < yEnd) && (xStart <= j && j < xEnd) {
-						prevIdx := (i-dy)*DB_GAME_WIDTH + (j - dx) + displacement
-						prevPoint := &g.points.dbPoints[1-g.points.curr][prevIdx]
-						*point = *prevPoint
+						g.WriteToBuffer(idx, point.steps)
+						if !point.finished {
+							g.th.idx0 <- idx
+						}
 					} else {
-						point.c = leftUp + complex(float64(j)*deltaX, float64(i)*deltaY)
-						point.z = STARTING_POINT
-						point.steps = 0
-						point.finished = false
-					}
-					g.WriteToBuffer(idx, point.steps)
-					if !point.finished {
-						g.th.idx <- idx
+						idx := i*DB_GAME_WIDTH + j + displacement
+						point := &g.points.dbPoints[g.points.curr1][idx]
+						if (yStart <= i && i < yEnd) && (xStart <= j && j < xEnd) {
+							prevIdx := (i-dy)*DB_GAME_WIDTH + (j - dx) + displacement
+							prevPoint := &g.points.dbPoints[1-g.points.curr1][prevIdx]
+							*point = *prevPoint
+						} else {
+							point.c = STARTING_POINT
+							point.z = leftUp + complex(float64(j)*deltaX, float64(i)*deltaY)
+							point.steps = 0
+							point.finished = false
+						}
+						g.WriteToBuffer(idx, point.steps)
+						if !point.finished {
+							g.th.idx1 <- idx
+						}
 					}
 				}
 			}
@@ -373,14 +480,32 @@ func Worker(g *Game) {
 		case <-g.th.haveToStop:
 			g.th.workingCount.Done()
 			<-g.th.canStart
-		case idx := <-g.th.idx:
-			point := &g.points.dbPoints[g.points.curr][idx]
+		case idx := <-g.th.idx0:
+			point := &g.points.dbPoints[g.points.curr0][idx]
 			z, stepDone := EscapeSteps(point.c, point.z, DELTA_STEP)
 			point.z = z
 			if stepDone == -1 {
 				point.steps += DELTA_STEP
 				if point.steps < MAX_STEP {
-					g.th.idx <- idx
+					g.th.idx0 <- idx
+				}
+				continue
+			}
+			point.steps += stepDone
+			point.finished = true
+			g.WriteToBuffer(idx, point.steps)
+			select {
+			case g.buf.updated <- true:
+			default:
+			}
+		case idx := <-g.th.idx1:
+			point := &g.points.dbPoints[g.points.curr1][idx]
+			z, stepDone := EscapeSteps(point.c, point.z, DELTA_STEP)
+			point.z = z
+			if stepDone == -1 {
+				point.steps += DELTA_STEP
+				if point.steps < MAX_STEP {
+					g.th.idx1 <- idx
 				}
 				continue
 			}
