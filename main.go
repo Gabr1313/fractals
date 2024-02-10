@@ -1,7 +1,8 @@
 package main
 
-// TODO?: julia set
-// TODO?: ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
+// @todo  refactor: logically separate screen 0 and screen 1 removing many if
+//        statementes
+// @todo? ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 
 import (
 	"log"
@@ -16,9 +17,10 @@ const (
 	SCREEN_WIDTH        = 720
 	SCREEN_HEIGHT       = 720
 	SQRT_DOTS_PER_PIXEL = 2
-	STARTING_POINT      = complex(0, 0)
+	STARTING_POINT_0    = complex(0, 0)
+	STARTING_POINT_1    = complex(0, 0)
 
-	// INITIAL_CENTER = complex(0, 1)
+	// INITIAL_CENTER_0 = complex(0, 1)
 	// INITIAL_ZOOM   = 2.5e-13
 	INITIAL_CENTER_0  = complex(-.75, 0)
 	INITIAL_CENTER_1  = complex(0, 0)
@@ -67,8 +69,9 @@ type PointStatus struct {
 }
 
 type Mouse struct {
-	isPressed bool
-	x, y      int
+	isPressedLeft  bool
+	isPressedRight bool
+	x, y           int
 }
 
 type Buffer struct {
@@ -97,6 +100,8 @@ type DoublePoints struct {
 	curr1     int
 	dbCentre0 [2]complex128
 	dbCentre1 [2]complex128
+	z0        complex128
+	c1        complex128
 	dbPoints  [2][]PointStatus
 }
 
@@ -149,6 +154,8 @@ func NewGame() *Game {
 			zoomY0:    INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
 			zoomX1:    INITIAL_ZOOM,
 			zoomY1:    INITIAL_ZOOM * GAME_HEIGHT / GAME_WIDTH,
+			z0:        STARTING_POINT_0,
+			c1:        STARTING_POINT_1,
 			curr0:     0,
 			curr1:     0,
 			dbCentre0: [2]complex128{INITIAL_CENTER_0, INITIAL_CENTER_0},
@@ -177,8 +184,7 @@ func NewGame() *Game {
 		},
 		image: ebiten.NewImage(DB_GAME_WIDTH, GAME_HEIGHT),
 		mouse: Mouse{
-			isPressed: false,
-			// x, y: default,
+			// defalut
 		},
 	}
 	g.th.workingCount.Add(g.th.nThreads)
@@ -187,10 +193,10 @@ func NewGame() *Game {
 	}
 	g.th.canReload1 <- true
 	g.currentScreen = 1
-	g.Reload()
+	g.Reload(g.currentScreen)
 	g.th.canReload0 <- true
 	g.currentScreen = 0
-	g.Reload()
+	g.Reload(g.currentScreen)
 	return &g
 }
 
@@ -210,29 +216,54 @@ func (g *Game) ReadMouse() {
 	x, y := ebiten.CursorPosition()
 	switch {
 	case inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft):
-		g.mouse.isPressed = true
-		g.mouse.x, g.mouse.y = x, y
+		g.mouse.isPressedLeft = true
 	case inpututil.IsMouseButtonJustReleased(ebiten.MouseButtonLeft):
-		g.mouse.isPressed = false
+		g.mouse.isPressedLeft = false
 	}
-	if g.mouse.isPressed && (x != g.mouse.x || y != g.mouse.y) {
-		g.PartiallyReload(x-g.mouse.x, y-g.mouse.y)
-	} else {
+	switch {
+	case inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonRight):
+		g.mouse.isPressedRight = true
+	case inpututil.IsMouseButtonJustReleased(ebiten.MouseButtonRight):
+		g.mouse.isPressedRight = false
+	}
+	if !g.mouse.isPressedLeft && !g.mouse.isPressedRight {
 		if x > GAME_WIDTH {
 			g.currentScreen = 1
 		} else {
 			g.currentScreen = 0
 		}
-		_, dy := ebiten.Wheel()
-		if dy != 0 {
-			var zoom float64
-			if dy > 0 {
-				zoom = ZOOM_DELTA / MOUSE_WHEEL_SPEED
-			} else {
-				zoom = MOUSE_WHEEL_SPEED / ZOOM_DELTA
+	}
+	if g.mouse.isPressedLeft && (x != g.mouse.x || y != g.mouse.y) {
+		g.PartiallyReload(g.currentScreen, x-g.mouse.x, y-g.mouse.y)
+	}
+	if g.mouse.isPressedRight {
+		mousePoint := complex(
+			float64(x-(GAME_WIDTH)/2-DisplacementX(g.currentScreen))*g.points.zoomX0/GAME_WIDTH,
+			float64(-y+GAME_HEIGHT/2)*g.points.zoomY0/GAME_HEIGHT,
+		)
+		if g.currentScreen == 0 {
+			mousePoint += g.points.dbCentre0[g.points.curr0]
+			if mousePoint != g.points.c1 {
+				g.points.c1 = mousePoint
+				g.Reload(1 - g.currentScreen)
 			}
-			g.ZoomFixedMouse(zoom, x, y)
+		} else {
+			mousePoint += g.points.dbCentre1[g.points.curr1]
+			if mousePoint != g.points.z0 {
+				g.points.z0 = mousePoint
+				g.Reload(1 - g.currentScreen)
+			}
 		}
+	}
+	_, dy := ebiten.Wheel()
+	if dy != 0 {
+		var zoom float64
+		if dy > 0 {
+			zoom = ZOOM_DELTA / MOUSE_WHEEL_SPEED
+		} else {
+			zoom = MOUSE_WHEEL_SPEED / ZOOM_DELTA
+		}
+		g.ZoomFixedMouse(zoom, x, y)
 	}
 	g.mouse.x, g.mouse.y = x, y
 }
@@ -241,6 +272,19 @@ func (g *Game) ReadKeyboard() error {
 	g.keys = inpututil.AppendPressedKeys(g.keys[:0])
 	for _, k := range g.keys {
 		switch k {
+		case ebiten.KeyE:
+			if g.currentScreen == 0 {
+				g.points.z0 = STARTING_POINT_0
+				g.points.dbCentre0[g.points.curr0] = INITIAL_CENTER_0
+				g.points.zoomX0 = INITIAL_ZOOM
+				g.points.zoomY0 = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
+			} else {
+				g.points.c1 = STARTING_POINT_1
+				g.points.dbCentre1[g.points.curr1] = INITIAL_CENTER_1
+				g.points.zoomX1 = INITIAL_ZOOM
+				g.points.zoomY1 = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
+			}
+			g.Reload(g.currentScreen)
 		case ebiten.KeyR:
 			if g.currentScreen == 0 {
 				g.points.dbCentre0[g.points.curr0] = INITIAL_CENTER_0
@@ -251,17 +295,17 @@ func (g *Game) ReadKeyboard() error {
 				g.points.zoomX1 = INITIAL_ZOOM
 				g.points.zoomY1 = GAME_HEIGHT * INITIAL_ZOOM / GAME_WIDTH
 			}
-			g.Reload()
+			g.Reload(g.currentScreen)
 		case ebiten.KeyQ:
 			return ebiten.Termination
 		case ebiten.KeyH, ebiten.KeyArrowLeft:
-			g.PartiallyReload(g.movementSpeed, 0)
+			g.PartiallyReload(g.currentScreen, g.movementSpeed, 0)
 		case ebiten.KeyJ, ebiten.KeyArrowDown:
-			g.PartiallyReload(0, -g.movementSpeed)
+			g.PartiallyReload(g.currentScreen, 0, -g.movementSpeed)
 		case ebiten.KeyK, ebiten.KeyArrowUp:
-			g.PartiallyReload(0, g.movementSpeed)
+			g.PartiallyReload(g.currentScreen, 0, g.movementSpeed)
 		case ebiten.KeyL, ebiten.KeyArrowRight:
-			g.PartiallyReload(-g.movementSpeed, 0)
+			g.PartiallyReload(g.currentScreen, -g.movementSpeed, 0)
 		case ebiten.KeyF, ebiten.KeySpace:
 			g.Zoom(ZOOM_DELTA)
 		case ebiten.KeyD, ebiten.KeyBackspace:
@@ -287,11 +331,11 @@ func (g *Game) Zoom(zoom float64) {
 		g.points.zoomX1 = newZoom
 		g.points.zoomY1 = newZoom * GAME_HEIGHT / GAME_WIDTH
 	}
-	g.Reload()
+	g.Reload(g.currentScreen)
 }
 
 func (g *Game) ZoomFixedMouse(zoom float64, mouseX, mouseY int) {
-	displacement := Displacement(g.currentScreen)
+	displacement := DisplacementX(g.currentScreen)
 	if g.currentScreen == 0 {
 		newZoom := g.points.zoomX0 * zoom
 		if newZoom < MIN_ZOOM {
@@ -325,20 +369,19 @@ func (g *Game) ZoomFixedMouse(zoom float64, mouseX, mouseY int) {
 		)
 		g.points.dbCentre1[g.points.curr1] += delta
 	}
-	g.Reload()
+	g.Reload(g.currentScreen)
 }
 
-func (g *Game) Reload() {
-	g.DoTheMath(42, 42, false)
+func (g *Game) Reload(screen int) {
+	g.DoTheMath(screen, 42, 42, false)
 }
 
-func (g *Game) PartiallyReload(dx, dy int) {
-	g.DoTheMath(dx, dy, true)
+func (g *Game) PartiallyReload(screen int, dx, dy int) {
+	g.DoTheMath(screen, dx, dy, true)
 }
 
-func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
-	currentScreen := g.currentScreen
-	if currentScreen == 0 {
+func (g *Game) DoTheMath(screen int, dx, dy int, cpyFlag bool) {
+	if screen == 0 {
 		select {
 		case <-g.th.canReload0:
 			defer func() {
@@ -362,7 +405,7 @@ func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
 	}
 	g.th.workingCount.Wait()
 	defer g.th.workingCount.Add(g.th.nThreads)
-	if currentScreen == 0 {
+	if screen == 0 {
 		close(g.th.idx0)
 		g.th.idx0 = make(chan int, GAME_WIDTH*GAME_HEIGHT)
 	} else {
@@ -373,7 +416,7 @@ func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
 	var leftUp complex128
 	var deltaX float64
 	var deltaY float64
-	if currentScreen == 0 {
+	if screen == 0 {
 		if cpyFlag {
 			g.points.curr0 = 1 - g.points.curr0
 			g.points.dbCentre0[g.points.curr0] = g.points.dbCentre0[1-g.points.curr0] +
@@ -413,7 +456,7 @@ func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
 		}
 	}
 
-	displacement := Displacement(currentScreen)
+	displacement := DisplacementX(screen)
 	for cpu := 0; cpu < g.th.nThreads; cpu = cpu + 1 {
 		minI := cpu
 		go func() {
@@ -432,7 +475,7 @@ func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
 					// 	default:
 					// 	}
 					// }
-					if currentScreen == 0 {
+					if screen == 0 {
 						idx := i*DB_GAME_WIDTH + j + displacement
 						point := &g.points.dbPoints[g.points.curr0][idx]
 						if (yStart <= i && i < yEnd) && (xStart <= j && j < xEnd) {
@@ -441,7 +484,7 @@ func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
 							*point = *prevPoint
 						} else {
 							point.c = leftUp + complex(float64(j)*deltaX, float64(i)*deltaY)
-							point.z = STARTING_POINT
+							point.z = g.points.z0
 							point.steps = 0
 							point.finished = false
 						}
@@ -457,7 +500,7 @@ func (g *Game) DoTheMath(dx, dy int, cpyFlag bool) {
 							prevPoint := &g.points.dbPoints[1-g.points.curr1][prevIdx]
 							*point = *prevPoint
 						} else {
-							point.c = STARTING_POINT
+							point.c = g.points.c1
 							point.z = leftUp + complex(float64(j)*deltaX, float64(i)*deltaY)
 							point.steps = 0
 							point.finished = false
@@ -482,7 +525,7 @@ func Worker(g *Game) {
 			<-g.th.canStart
 		case idx := <-g.th.idx0:
 			point := &g.points.dbPoints[g.points.curr0][idx]
-			z, stepDone := EscapeSteps(point.c, point.z, DELTA_STEP)
+			z, stepDone := EscapeSteps(point.z, point.c, DELTA_STEP)
 			point.z = z
 			if stepDone == -1 {
 				point.steps += DELTA_STEP
@@ -500,7 +543,7 @@ func Worker(g *Game) {
 			}
 		case idx := <-g.th.idx1:
 			point := &g.points.dbPoints[g.points.curr1][idx]
-			z, stepDone := EscapeSteps(point.c, point.z, DELTA_STEP)
+			z, stepDone := EscapeSteps(point.z, point.c, DELTA_STEP)
 			point.z = z
 			if stepDone == -1 {
 				point.steps += DELTA_STEP
@@ -520,7 +563,7 @@ func Worker(g *Game) {
 	}
 }
 
-func EscapeSteps(c, z complex128, maxStep int) (complex128, int) {
+func EscapeSteps(z, c complex128, maxStep int) (complex128, int) {
 	for i := 0; i < maxStep; i++ {
 		z = z*z + c
 		if real(z)*real(z)+imag(z)*imag(z) > THRESHOLD*THRESHOLD {
@@ -540,7 +583,7 @@ func (g *Game) WriteToBuffer(idx, s int) {
 	(*content)[idx+3] = (*pal)[3]
 }
 
-func Displacement(screenNumber int) int {
+func DisplacementX(screenNumber int) int {
 	if screenNumber != 0 {
 		return GAME_WIDTH
 	}
