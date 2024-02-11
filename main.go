@@ -1,7 +1,8 @@
 package main
 
 // @todo? ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
-// @todo  blending
+// @todo  blending (do i need to do all the calculations even if the point
+//        diverges?)
 
 import (
 	"log"
@@ -430,14 +431,14 @@ func Worker(g *Game) {
 			g.th.workingCount.Done()
 			<-g.th.canStart
 		case idx := <-g.th.idx[0]:
-			g.newFunction(idx, 0)
+			g.updatePoint(idx, 0)
 		case idx := <-g.th.idx[1]:
-			g.newFunction(idx, 1)
+			g.updatePoint(idx, 1)
 		}
 	}
 }
 
-func (g *Game) newFunction(idx int, cs int) {
+func (g *Game) updatePoint(idx int, cs int) {
 	point := &g.dbPoints[g.points[cs].curr][idx]
 	z, stepDone := EscapeSteps(point.z, point.c, DELTA_STEP)
 	point.z = z
