@@ -28,18 +28,20 @@ const (
 	INITIAL_ZOOM_1   = 4
 	INITIAL_CENTER_1 = complex(0, 0)
 
-	DELTA_STEP        = 1024
-	MAX_STEP          = DELTA_STEP * 8
+	// DELTA_STEP        = 1024 * 8
+	// MAX_STEP          = DELTA_STEP
+	DELTA_STEP        = 512 
+	MAX_STEP          = DELTA_STEP * 16
 	ZOOM_DELTA        = .9
 	MOUSE_WHEEL_SPEED = 1.2
 	MOVEMENT_SPEED    = SCREEN_WIDTH / 50
 
 	// below values should not be changed
-	DB_SCREEN_WIDTH = 720 * 2
+	DB_SCREEN_WIDTH = SCREEN_WIDTH * 2
 	DB_GAME_WIDTH   = DB_SCREEN_WIDTH * SQRT_DOTS_PER_PIXEL
 	GAME_WIDTH      = SCREEN_WIDTH * SQRT_DOTS_PER_PIXEL
 	GAME_HEIGHT     = SCREEN_HEIGHT * SQRT_DOTS_PER_PIXEL
-	THRESHOLD       = float64(2)
+	THRESHOLD       = 2.0
 	MIN_ZOOM        = 2.5e-13
 )
 
@@ -442,14 +444,14 @@ func (g *Game) updatePoint(idx int, cs int) {
 	point := &g.dbPoints[g.points[cs].curr][idx]
 	z, stepDone := EscapeSteps(point.z, point.c, DELTA_STEP)
 	point.z = z
-	if stepDone == -1 {
+	point.steps += stepDone
+	if stepDone == DELTA_STEP {
 		point.steps += DELTA_STEP
 		if point.steps < MAX_STEP {
 			g.th.idx[cs] <- idx
 		}
 		return
 	}
-	point.steps += stepDone
 	point.finished = true
 	g.WriteToBuffer(idx, point.steps)
 	select {
@@ -459,13 +461,20 @@ func (g *Game) updatePoint(idx int, cs int) {
 }
 
 func EscapeSteps(z, c complex128, maxStep int) (complex128, int) {
+	a := real(z)
+	b := imag(z)
+	x := real(c)
+	y := imag(c)
 	for i := 0; i < maxStep; i++ {
-		z = z*z + c
-		if real(z)*real(z)+imag(z)*imag(z) > THRESHOLD*THRESHOLD {
-			return z, i
+		a2 := a * a
+		b2 := b * b
+		if a2+b2 > THRESHOLD*THRESHOLD {
+			return complex(a, b), i
 		}
+		b = 2*a*b + y
+		a = a2 - b2 + x
 	}
-	return z, -1
+	return complex(a, b), maxStep
 }
 
 func (g *Game) WriteToBuffer(idx, s int) {
